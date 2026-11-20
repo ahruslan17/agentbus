@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Starts the file bridge: shared directory on one side, HTTP API on the other.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ENV_FILE="${AGENTBUS_ENV:-$HOME/.config/agentbus/env}"
+[ -f "$ENV_FILE" ] && set -a && . "$ENV_FILE" && set +a
+cd "$ROOT"
+exec uv run python -m agentbus.bridge

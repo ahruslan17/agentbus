@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# ab — tiny client for the agentbus queue. Meant to be dropped into an agent's PATH.
+#
+#   export AGENTBUS_SELF=cage-claude      # who am I
+#   export AGENTBUS_TOKEN=...
+#   export AGENTBUS_URL=http://host:8787  # UI default: localhost
+#
+#   ab send --to local-opencode --repo ~/personal/real-inflation --kind task "сделай T1"
+#   ab wait <message_id> --text
+#   ab lease cage-claude --wait 60
+#   ab reply <message_id> --kind verdict --body-file review.md
+#   ab show <message_id> | jq .
+set -euo pipefail
+
+ENV_FILE="${AGENTBUS_ENV:-$HOME/.config/agentbus/env}"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+: "${AGENTBUS_URL:=http://127.0.0.1:8787}"
+AGENTBUS_URL="${AGENTBUS_URL%/}"
+
+usage() {
+  cat <<'EOF'
+usage: ab <command> [options]
+
+  health
+  send     --to AGENT [--kind task|fix|question|note|verdict]
+           [--thread ID] [--repo PATH] [--base REF] [--parent ID]
+           [--meta JSON] [--key KEY] [--body-file FILE | BODY | stdin]
+  wait     MESSAGE_ID [--timeout SECONDS] [--text]
+  lease    AGENT [--wait SECONDS] [--kinds a,b] [--text]
+  reply    MESSAGE_ID [--kind result|verdict|ack] [--meta JSON] [--body-file FILE | BODY | stdin]
+  state    MESSAGE_ID done|failed [--note TEXT]
+  show     MESSAGE_ID [--text]
+  thread   THREAD_ID [--text]
+  file     MESSAGE_ID PATH
+  artifact MESSAGE_ID NAME
+  inbox    AGENT
+
+Environment: AGENTBUS_URL, AGENTBUS_TOKEN, AGENTBUS_SELF.
+EOF
+}
+
+die() { echo "ab: $*" >&2; exit 1; }
+
+request() {
+  local method=$1 path=$2
+  shift 2
+  [ -n "${AGENTBUS_TOKEN:-}" ] || die "AGENTBUS_TOKEN is not set"
+  curl -sS -X "$method" "$AGENTBUS_URL$path" \
+    -H "Authorization: Bearer $AGENTBUS_TOKEN" \
+    -H "Content-Type: application/json" "$@"
+}
+
+read_body() {
+  local positional=("$@")
+  local body=""
+  if [ ${#positional[@]} -gt 0 ]; then
+    body="${positional[*]}"
+  elif [ -n "${FLAG_BODY_FILE:-}" ]; then
+    body=$(cat "$FLAG_BODY_FILE")
+  elif [ ! -t 0 ]; then
+    body=$(cat)
+  fi
+  [ -n "$body" ] || die "empty body"
+  printf '%s' "$body"
+}
+
+from_flags() {
+  FLAG_THREAD=""; FLAG_REPO=""; FLAG_BASE=""; FLAG_PARENT=""; FLAG_META="{}"
+  FLAG_KEY=""; FLAG_KIND="task"; FLAG_TO=""; FLAG_TIMEOUT=1800; FLAG_TEXT=0
+  FLAG_KINDS=""; FLAG_NOTE=""; FLAG_WAIT=0; FLAG_BODY_FILE=""
+  local rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) FLAG_TO=$2; shift 2 ;;
+      --kind) FLAG_KIND=$2; shift 2 ;;
+      --thread) FLAG_THREAD=$2; shift 2 ;;
+      --repo) FLAG_REPO=$2; shift 2 ;;
+      --base) FLAG_BASE=$2; shift 2 ;;
+      --parent) FLAG_PARENT=$2; shift 2 ;;
+      --meta) FLAG_META=$2; shift 2 ;;
+      --key) FLAG_KEY=$2; shift 2 ;;
+      --body-file) FLAG_BODY_FILE=$2; shift 2 ;;
+      --timeout) FLAG_TIMEOUT=$2; shift 2 ;;
+      --text) FLAG_TEXT=1; shift ;;
+      --wait) FLAG_WAIT=$2; shift 2 ;;
+      --kinds) FLAG_KINDS=$2; shift 2 ;;
+      --note) FLAG_NOTE=$2; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  REST=("${rest[@]}")
+}
+
+cmd_health() { request GET /v1/health | jq .; }
+
+cmd_send() {
+  from_flags "$@"
+  [ -n "$FLAG_TO" ] || die "--to is required"
+  local self="${AGENTBUS_SELF:?AGENTBUS_SELF is not set}"
+  local body
+  body=$(read_body "${REST[@]}")
+  local payload
+  payload=$(jq -n \
+    --arg sender "$self" --arg recipient "$FLAG_TO" --arg kind "$FLAG_KIND" --arg body "$body" \
+    --arg thread "$FLAG_THREAD" --arg repo "$FLAG_REPO" --arg base "$FLAG_BASE" \
+    --arg parent "$FLAG_PARENT" --arg key "$FLAG_KEY" --argjson meta "$FLAG_META" \
+    '{sender: $sender, recipient: $recipient, kind: $kind, body: $body}
+     + (if $thread == "" then {} else {thread_id: $thread} end)
+     + (if $repo == "" then {} else {repo: $repo} end)
+     + (if $base == "" then {} else {base_ref: $base} end)
+     + (if $parent == "" then {} else {parent_id: $parent} end)
+     + (if $key == "" then {} else {idempotency_key: $key} end)
+     + {meta: $meta}')
+  request POST /v1/messages -d "$payload" | jq .
+}
+
+cmd_wait() {
+  from_flags "$@"
+  local id="${REST[0]:?MESSAGE_ID is required}" started=$SECONDS msg view reply state
+  while :; do
+    msg=$(request GET "/v1/messages/$id")
+    if ! jq -e '.id' >/dev/null 2>&1 <<<"$msg"; then echo "$msg" >&2; return 1; fi
+    view=$(request GET "/v1/threads/$(jq -r '.thread_id' <<<"$msg")")
+    reply=$(jq -c --arg id "$id" '[.messages[] | select(.parent_id == $id)][0] // empty' <<<"$view")
+    if [ -n "$reply" ]; then
+      if [ "$FLAG_TEXT" = 1 ]; then jq -r '.body' <<<"$reply"; jq -r '.meta.diff_stat // empty' <<<"$reply" >&2
+      else jq . <<<"$reply"; fi
+      return 0
+    fi
+    state=$(jq -r '.state' <<<"$msg")
+    if [ "$state" = failed ] || [ "$state" = cancelled ]; then
+      echo "message $id ended as $state" >&2
+      jq . <<<"$msg"
+      return 2
+    fi
+    if [ $((SECONDS - started)) -gt "$FLAG_TIMEOUT" ]; then
+      echo "timeout after ${FLAG_TIMEOUT}s waiting for $id" >&2
+      return 3
+    fi
+    sleep 2
+  done
+}
+
+cmd_lease() {
+  from_flags "$@"
+  local agent="${REST[0]:?AGENT is required}" wait="${FLAG_WAIT:-0}" out
+  local query="?wait=$wait"
+  [ -n "$FLAG_KINDS" ] && query="$query&kinds=$FLAG_KINDS"
+  out=$(request POST "/v1/inbox/$agent/lease$query")
+  if [ -z "$out" ]; then
+    echo "no message" >&2
+    return 4
+  fi
+  if [ "$FLAG_TEXT" = 1 ]; then jq -r '"# \(.id) from \(.sender) [\(.kind)]\n\n\(.body)"' <<<"$out"
+  else jq . <<<"$out"; fi
+}
+
+cmd_reply() {
+  from_flags "$@"
+  local id="${REST[0]:?MESSAGE_ID is required}"
+  local self="${AGENTBUS_SELF:?AGENTBUS_SELF is not set}"
+  local body
+  body=$(read_body "${REST[@]:1}")
+  local payload
+  payload=$(jq -n --arg sender "$self" --arg kind "$FLAG_KIND" --arg body "$body" \
+    --argjson meta "$FLAG_META" '{sender: $sender, kind: $kind, body: $body, meta: $meta}')
+  request POST "/v1/messages/$id/reply" -d "$payload" | jq .
+}
+
+cmd_state() {
+  from_flags "$@"
+  local id="${REST[0]:?MESSAGE_ID is required}" state="${REST[1]:?state is required}"
+  local payload
+  payload=$(jq -n --arg state "$state" --arg note "$FLAG_NOTE" \
+    '{state: $state} + (if $note == "" then {} else {note: $note} end)')
+  request POST "/v1/messages/$id/state" -d "$payload" | jq .
+}
+
+cmd_show() {
+  from_flags "$@"
+  local id="${REST[0]:?MESSAGE_ID is required}" out
+  out=$(request GET "/v1/messages/$id")
+  if [ "$FLAG_TEXT" = 1 ]; then jq -r '"# \(.id) \(.sender) -> \(.recipient) [\(.kind)] \(.state)\n\n\(.body)"' <<<"$out"
+  else jq . <<<"$out"; fi
+}
+
+cmd_thread() {
+  from_flags "$@"
+  local id="${REST[0]:?THREAD_ID is required}" out
+  out=$(request GET "/v1/threads/$id")
+  if [ "$FLAG_TEXT" = 1 ]; then
+    jq -r '.messages[] | "── \(.id) \(.sender) -> \(.recipient) [\(.kind)] \(.state)\n\(.body)\n"' <<<"$out"
+  else jq . <<<"$out"; fi
+}
+
+cmd_file() {
+  from_flags "$@"
+  local id="${REST[0]:?MESSAGE_ID is required}" path="${REST[1]:-}"
+  request GET "/v1/messages/$id/file?path=$(jq -rn --arg p "$path" '$p|@uri')" | jq .
+}
+
+cmd_artifact() {
+  from_flags "$@"
+  local id="${REST[0]:?MESSAGE_ID is required}" name="${REST[1]:?NAME is required}"
+  request GET "/v1/messages/$id/artifact?name=$(jq -rn --arg n "$name" '$n|@uri')" | jq -r '.content'
+}
+
+cmd_inbox() {
+  from_flags "$@"
+  local agent="${REST[0]:?AGENT is required}"
+  request GET "/v1/inbox/$agent" | jq .
+}
+
+main() {
+  local cmd="${1:-}"
+  [ -n "$cmd" ] || { usage; exit 1; }
+  shift
+  case "$cmd" in
+    health) cmd_health "$@" ;;
+    send) cmd_send "$@" ;;
+    wait) cmd_wait "$@" ;;
+    lease) cmd_lease "$@" ;;
+    reply) cmd_reply "$@" ;;
+    state) cmd_state "$@" ;;
+    show) cmd_show "$@" ;;
+    thread) cmd_thread "$@" ;;
+    file) cmd_file "$@" ;;
+    artifact) cmd_artifact "$@" ;;
+    inbox) cmd_inbox "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

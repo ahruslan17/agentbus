@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""cb — agentbus client for a VM that has no network access, only a shared directory.
+
+Everything it does is files inside $AGENTBUS_SHARE (the agent's own folder in the share):
+
+    cb send --to local-opencode --repo /path/to/repo "сделай X"   # -> outbox/
+    cb inbox                                                      # new messages
+    cb show m_...                                                 # message.json
+    cb body m_... | cb patch m_...                                 # text / diff
+    cb reply m_... --kind verdict "правь Y"                        # -> outbox/
+    cb read m_...                                                  # move to read/
+
+Only the standard library is used, so it runs anywhere python3 exists.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+def share() -> Path:
+    raw = os.environ.get("AGENTBUS_SHARE", "").strip()
+    if not raw:
+        sys.exit("cb: AGENTBUS_SHARE is not set (e.g. ~/cage-bridge/cage-claude)")
+    root = Path(os.path.expanduser(raw))
+    if not root.is_dir():
+        sys.exit(f"cb: share directory does not exist: {root}")
+    return root
+
+
+def read_message(root: Path, message_id: str) -> dict:
+    for folder in ("inbox", "read"):
+        path = root / folder / message_id / "message.json"
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    sys.exit(f"cb: unknown message: {message_id}")
+
+
+def drop(root: Path, payload: dict) -> Path:
+    outbox = root / "outbox"
+    outbox.mkdir(parents=True, exist_ok=True)
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
+    staging = outbox / f".{name}.tmp"
+    staging.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    target = outbox / name
+    os.replace(staging, target)
+    return target
+
+
+def read_body(args: argparse.Namespace) -> str:
+    if getattr(args, "body_flag", None):
+        return args.body_flag
+    if args.text:
+        return " ".join(args.text)
+    if args.body_file:
+        return Path(args.body_file).read_text(encoding="utf-8")
+    if not sys.stdin.isatty():
+        data = sys.stdin.read()
+        if data.strip():
+            return data
+    sys.exit("cb: empty body")
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    root = share()
+    payload: dict = {
+        "recipient": args.to,
+        "kind": args.kind,
+        "body": read_body(args),
+        "meta": json.loads(args.meta),
+    }
+    for flag, key in (("thread", "thread_id"), ("repo", "repo"), ("base", "base_ref"),
+                      ("parent", "parent_id")):
+        value = getattr(args, flag)
+        if value:
+            payload[key] = value
+    path = drop(root, payload)
+    shown = {k: v for k, v in payload.items() if k != "body"}
+    print(json.dumps({"queued_file": str(path), **shown}, ensure_ascii=False, indent=2))
+    print("host заберёт файл в течение пары секунд", file=sys.stderr)
+    return 0
+
+
+def cmd_reply(args: argparse.Namespace) -> int:
+    root = share()
+    original = read_message(root, args.message_id)
+    payload = {
+        "recipient": original["sender"],
+        "kind": args.kind,
+        "body": read_body(args),
+        "thread_id": original.get("thread_id"),
+        "parent_id": args.message_id,
+        "meta": json.loads(args.meta),
+    }
+    path = drop(root, payload)
+    print(json.dumps({"queued_file": str(path), "reply_to": args.message_id,
+                      "recipient": payload["recipient"], "kind": payload["kind"]},
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    root = share()
+    inbox = root / "inbox"
+    read = root / "read"
+    entries = sorted((p for p in inbox.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                     key=lambda p: p.name)
+    shown = 0
+    for folder in entries:
+        if (read / folder.name).exists():
+            continue
+        message = json.loads((folder / "message.json").read_text(encoding="utf-8"))
+        if args.folder:
+            print(folder.name)
+        else:
+            first = (message.get("body") or "").strip().splitlines()
+            print(f"{message['id']}  [{message['kind']}] от {message['sender']}  "
+                  f"тред {message.get('thread_id')}")
+            if first:
+                print(f"    {first[0][:160]}")
+            if message.get("artifacts"):
+                print(f"    файлы: {', '.join(message['artifacts'])}")
+        shown += 1
+    if not shown and not args.folder:
+        print("новых сообщений нет")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    root = share()
+    message = read_message(root, args.message_id)
+    if args.text:
+        print(f"# {message['id']} [{message['kind']}] от {message['sender']} "
+              f"тред {message.get('thread_id')}\n")
+        print(message.get("body") or "")
+        stat = (message.get("meta") or {}).get("diff_stat")
+        if stat:
+            print("\n" + stat)
+    else:
+        print(json.dumps(message, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_body(args: argparse.Namespace) -> int:
+    message = read_message(share(), args.message_id)
+    print(message.get("body") or "")
+    return 0
+
+
+def cmd_file(args: argparse.Namespace) -> int:
+    root = share()
+    for folder in ("inbox", "read"):
+        path = root / folder / args.message_id / args.name
+        if path.is_file():
+            sys.stdout.write(path.read_text(encoding="utf-8", errors="replace"))
+            return 0
+    sys.exit(f"cb: no {args.name} for {args.message_id}")
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    root = share()
+    source = root / "inbox" / args.message_id
+    if not source.is_dir():
+        sys.exit(f"cb: inbox/{args.message_id} not found")
+    target = root / "read" / args.message_id
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.move(str(source), str(target))
+    print(f"moved to read/{args.message_id}")
+    return 0
+
+
+def cmd_sent(args: argparse.Namespace) -> int:
+    root = share()
+    sent = root / "sent"
+    failed = root / "failed"
+    names = sorted(p.name for p in sent.glob("*.json")) if sent.is_dir() else []
+    for name in names:
+        print(f"sent   {name}")
+    if failed.is_dir():
+        for path in sorted(failed.glob("*.json")):
+            error = path.with_suffix(".error")
+            detail = error.read_text(encoding="utf-8").strip() if error.is_file() else ""
+            print(f"failed {path.name}  {detail[:120]}")
+    if not names and not (failed.is_dir() and any(failed.iterdir())):
+        print("пусто")
+    return 0
+
+
+def cmd_env(args: argparse.Namespace) -> int:
+    root = share()
+    print(json.dumps({
+        "share": str(root),
+        "outbox": str(root / "outbox"),
+        "inbox": str(root / "inbox"),
+        "unread": sum(1 for p in (root / "inbox").iterdir()
+                      if p.is_dir() and not (root / "read" / p.name).exists())
+        if (root / "inbox").is_dir() else 0,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+class _SubParser(argparse.ArgumentParser):
+    """Subcommands must not abbreviate flags: --body is not --body-file."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cb", description="agentbus client over a shared directory")
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=_SubParser)
+
+    send = sub.add_parser("send", help="положить сообщение в outbox")
+    send.add_argument("--to", required=True)
+    send.add_argument("--kind", default="task")
+    send.add_argument("--thread")
+    send.add_argument("--repo")
+    send.add_argument("--base")
+    send.add_argument("--parent")
+    send.add_argument("--meta", default="{}")
+    send.add_argument("--body-file")
+    send.add_argument("--body")
+    send.add_argument("text", nargs="*")
+    send.set_defaults(func=cmd_send)
+
+    reply = sub.add_parser("reply", help="ответить на сообщение")
+    reply.add_argument("message_id")
+    reply.add_argument("--kind", default="verdict")
+    reply.add_argument("--meta", default="{}")
+    reply.add_argument("--body-file")
+    reply.add_argument("--body")
+    reply.add_argument("text", nargs="*")
+    reply.set_defaults(func=cmd_reply)
+
+    inbox = sub.add_parser("inbox", help="новые сообщения")
+    inbox.add_argument("--folder", action="store_true", help="только id")
+    inbox.set_defaults(func=cmd_inbox)
+
+    show = sub.add_parser("show", help="сообщение целиком")
+    show.add_argument("message_id")
+    show.add_argument("--text", action="store_true")
+    show.set_defaults(func=cmd_show)
+
+    body = sub.add_parser("body", help="текст сообщения")
+    body.add_argument("message_id")
+    body.set_defaults(func=cmd_body)
+
+    patch = sub.add_parser("patch", help="diff из ответа исполнителя")
+    patch.add_argument("message_id")
+    patch.set_defaults(
+        func=lambda a: cmd_file(argparse.Namespace(message_id=a.message_id, name="patch.diff"))
+    )
+
+    read = sub.add_parser("read", help="перенести в read/")
+    read.add_argument("message_id")
+    read.set_defaults(func=cmd_read)
+
+    sent = sub.add_parser("sent", help="что ушло в очередь")
+    sent.set_defaults(func=cmd_sent)
+
+    env = sub.add_parser("env", help="пути и состояние")
+    env.set_defaults(func=cmd_env)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    parser.allow_abbrev = False
+    args = parser.parse_args()
+    if getattr(args, "body", None):
+        args.body_flag = args.body
+    else:
+        args.body_flag = None
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

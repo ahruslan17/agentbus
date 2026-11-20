@@ -1,0 +1,13 @@
+[Unit]
+Description=agentbus file bridge (isolated VM share <-> queue)
+After=agentbus-api.service
+Requires=agentbus-api.service
+
+[Service]
+Type=simple
+ExecStart=%h/personal/agentbus/bin/agentbus-bridge
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

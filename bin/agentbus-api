@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Starts the API with settings from ~/.config/agentbus/env.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ENV_FILE="${AGENTBUS_ENV:-$HOME/.config/agentbus/env}"
+[ -f "$ENV_FILE" ] && set -a && . "$ENV_FILE" && set +a
+cd "$ROOT"
+exec uv run uvicorn agentbus.api:build_app --factory \
+  --host "${AGENTBUS_BIND_HOST:-127.0.0.1}" \
+  --port "${AGENTBUS_BIND_PORT:-8787}"

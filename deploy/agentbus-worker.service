@@ -1,0 +1,14 @@
+[Unit]
+Description=agentbus executor worker (OpenCode)
+After=agentbus-api.service
+Requires=agentbus-api.service
+
+[Service]
+Type=simple
+ExecStart=%h/personal/agentbus/bin/agentbus-worker
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

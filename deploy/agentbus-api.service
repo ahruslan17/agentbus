@@ -1,0 +1,13 @@
+[Unit]
+Description=agentbus API
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/personal/agentbus/bin/agentbus-api
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
