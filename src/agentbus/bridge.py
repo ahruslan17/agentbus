@@ -132,8 +132,13 @@ class Bridge:
         delivered = 0
         for message in response.json().get("messages", []):
             message_id = str(message["id"])
-            if (self.markers / message_id).exists():
-                continue
+            marker = self.markers / message_id
+            if marker.exists():
+                # The directory can disappear if the share was moved or cleaned:
+                # a marker alone would keep the message queued forever.
+                if (self.inbox / message_id).is_dir() or (self.root / "read" / message_id).is_dir():
+                    continue
+                marker.unlink()
             target = self.inbox / message_id
             staging = self.inbox / f".{message_id}.tmp"
             shutil.rmtree(staging, ignore_errors=True)
@@ -184,8 +189,37 @@ class Bridge:
             return content[:MAX_INBOX_BYTES]
         return content
 
-    def run_once(self) -> tuple[int, int]:
-        return self.pump_outbox(), self.pump_inbox()
+    # --- ack: read/ means handled ----------------------------------------------
+
+    def pump_read(self) -> int:
+        """Moving a delivered message into read/ closes it in the queue."""
+        read = self.root / "read"
+        if not read.is_dir():
+            return 0
+        acked = 0
+        for folder in sorted(read.iterdir()):
+            if not folder.is_dir() or folder.name.startswith("."):
+                continue
+            message_id = folder.name
+            if (self.markers / f"{message_id}.acked").exists():
+                continue
+            try:
+                response = self.api.post(
+                    f"/v1/messages/{message_id}/state",
+                    json={"state": "done", "note": "read in the VM"},
+                )
+            except httpx.HTTPError as exc:
+                log(f"ack {message_id} failed: {exc}")
+                continue
+            if response.status_code in (200, 404):
+                (self.markers / f"{message_id}.acked").write_text("", encoding="utf-8")
+                acked += 1
+            else:
+                log(f"ack {message_id} failed: {response.status_code}")
+        return acked
+
+    def run_once(self) -> tuple[int, int, int]:
+        return self.pump_outbox(), self.pump_inbox(), self.pump_read()
 
 
 def _unique(path: Path) -> Path:

@@ -47,7 +47,7 @@ def test_outbox_file_becomes_a_message(client: TestClient, tmp_path: Path) -> No
         },
     )
 
-    sent, _ = bridge.run_once()
+    sent, _, _ = bridge.run_once()
 
     assert sent == 1
     assert not list((tmp_path / "share" / "cage-claude" / "outbox").glob("*.json"))
@@ -112,7 +112,7 @@ def test_replies_are_delivered_with_artifacts(
 
     share = tmp_path / "share"
     bridge = make_bridge(client, share, tmp_path / "state")
-    _, delivered = bridge.run_once()
+    _, delivered, _ = bridge.run_once()
 
     assert delivered == 1
     folder = share / "cage-claude" / "inbox" / reply["id"]
@@ -123,7 +123,7 @@ def test_replies_are_delivered_with_artifacts(
     assert (folder / "patch.diff").read_text(encoding="utf-8").startswith("--- a")
 
     # a second pass must not redeliver
-    _, again = bridge.run_once()
+    _, again, _ = bridge.run_once()
     assert again == 0
 
 
@@ -150,6 +150,42 @@ def test_reply_from_the_vm_closes_the_task(client: TestClient, tmp_path: Path) -
     verdict = client.post("/v1/inbox/local-opencode/lease").json()
     assert verdict["kind"] == "verdict"
     assert verdict["body"] == "правь Y"
+
+
+def test_lost_delivery_is_repeated(client: TestClient, tmp_path: Path) -> None:
+    message = send(client, recipient="cage-claude", sender="local-opencode", kind="result")
+    share = tmp_path / "share"
+    bridge = make_bridge(client, share, tmp_path / "state")
+    _, delivered, _ = bridge.run_once()
+    assert delivered == 1
+
+    import shutil
+
+    shutil.rmtree(share / "cage-claude" / "inbox" / message["id"])
+
+    _, again, _ = bridge.run_once()
+    assert again == 1
+    assert (share / "cage-claude" / "inbox" / message["id"] / "message.json").is_file()
+
+
+def test_read_closes_the_message(client: TestClient, tmp_path: Path) -> None:
+    message = send(client, recipient="cage-claude", sender="local-opencode", kind="result")
+    share = tmp_path / "share"
+    bridge = make_bridge(client, share, tmp_path / "state")
+    bridge.run_once()
+    assert client.get(f"/v1/messages/{message['id']}").json()["state"] == "queued"
+
+    folder = share / "cage-claude" / "inbox" / message["id"]
+    target = share / "cage-claude" / "read" / message["id"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    folder.rename(target)
+
+    _, _, acked = bridge.run_once()
+    assert acked == 1
+    assert client.get(f"/v1/messages/{message['id']}").json()["state"] == "done"
+
+    _, _, again = bridge.run_once()
+    assert again == 0
 
 
 def test_share_layout_is_created(client: TestClient, tmp_path: Path) -> None:
