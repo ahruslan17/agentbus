@@ -135,6 +135,28 @@ cage run /home/ruslan/personal/agentbus/bin/cb inbox
 Ещё одно следствие: токен и `AGENTBUS_URL` в cage не попадают вообще. Скомпрометировать
 мост можно только записью файлов в шар, а он и так доступен только этой VM.
 
+## Скилл для агента в cage
+
+`skills/agentbus/SKILL.md` — инструкция для Claude в изоляции: как ставить задачу,
+что класть в `meta`, как читать патч и как выдавать вердикт. Ставится симлинком,
+поэтому обновления из репозитория подхватываются сами:
+
+```bash
+# внутри VM
+mkdir -p ~/.claude/skills
+ln -sfn /home/ruslan/personal/agentbus/skills/agentbus ~/.claude/skills/agentbus
+
+# на хосте, если тот же скилл нужен OpenCode
+mkdir -p ~/.config/opencode/skills
+ln -sfn ~/personal/agentbus/skills/agentbus ~/.config/opencode/skills/agentbus
+```
+
+Проверка, что скилл виден:
+
+```bash
+head -3 ~/.claude/skills/agentbus/SKILL.md
+```
+
 ## Что в отчёте исполнителя
 
 
