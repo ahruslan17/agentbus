@@ -26,12 +26,22 @@ from pathlib import Path
 
 
 def share() -> Path:
+    """AGENTBUS_SHARE wins; otherwise the share sits next to this checkout.
+
+    <...>/agentbus/bin/cb  ->  <...>/.agentbus/cage-claude
+
+    The same spelling holds in the VM, because Cage mounts a project folder at
+    its own host path, so no per-side configuration is needed.
+    """
     raw = os.environ.get("AGENTBUS_SHARE", "").strip()
-    if not raw:
-        sys.exit("cb: AGENTBUS_SHARE is not set (e.g. ~/cage-bridge/cage-claude)")
-    root = Path(os.path.expanduser(raw))
+    if raw:
+        root = Path(os.path.expanduser(raw))
+    else:
+        here = Path(os.path.realpath(__file__))
+        root = here.parents[2] / ".agentbus" / "cage-claude"
     if not root.is_dir():
-        sys.exit(f"cb: share directory does not exist: {root}")
+        sys.exit(f"cb: share directory does not exist: {root}\n"
+                 f"cb: set AGENTBUS_SHARE or create it")
     return root
 
 
