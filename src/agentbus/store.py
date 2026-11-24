@@ -294,6 +294,37 @@ def lease_message(
     return row
 
 
+def release(conn: psycopg.Connection, *, message_id: str, owner: str) -> dict[str, Any] | None:
+    """Give a leased message back to the queue without counting the attempt.
+
+    A worker that receives a lease while stopping must not hold it until the TTL: the
+    message is queued again at once. Returns `None` unless `owner` really held the lease.
+    """
+    row = conn.execute(
+        """
+        update messages
+           set state = 'queued',
+               lease_owner = null,
+               lease_until = null,
+               attempt = attempt - 1,
+               updated_at = now()
+         where id = %s and state = 'leased' and lease_owner = %s
+        returning *
+        """,
+        (message_id, owner),
+    ).fetchone()
+    if row is not None:
+        _event(
+            conn,
+            kind="released",
+            message_id=row["id"],
+            thread_id=row["thread_id"],
+            actor=owner,
+            data={},
+        )
+    return row
+
+
 def heartbeat(
     conn: psycopg.Connection, *, message_id: str, ttl_seconds: int
 ) -> dict[str, Any] | None:

@@ -149,3 +149,58 @@ def test_expired_lease_frees_the_thread(client: TestClient) -> None:
     again = lease(client).json()
     assert again["id"] == task["id"]
     assert again["attempt"] == 2
+
+
+def release(client: TestClient, message_id: str, owner: str):
+    return client.post(f"/v1/messages/{message_id}/release", json={"owner": owner})
+
+
+def test_release_by_its_owner_returns_the_message_to_the_queue(client: TestClient) -> None:
+    task = send(client, kind="task", body="работа")
+    leased = lease(client, owner="local-opencode#2").json()
+    assert leased["id"] == task["id"]
+    assert leased["attempt"] == 1
+
+    response = release(client, task["id"], "local-opencode#2")
+
+    assert response.status_code == 200
+    row = response.json()
+    assert row["state"] == "queued"
+    assert row["lease_owner"] is None
+    assert row["lease_until"] is None
+    assert row["attempt"] == 0
+
+    events = client.get(f"/v1/threads/{task['thread_id']}/events").json()["events"]
+    assert events[-1]["kind"] == "released"
+    assert events[-1]["actor"] == "local-opencode#2"
+
+    # the released message is handed out again right away, with a fresh attempt
+    again = lease(client, owner="local-opencode#2").json()
+    assert again["id"] == task["id"]
+    assert again["attempt"] == 1
+
+
+def test_release_by_a_foreign_owner_is_rejected(client: TestClient) -> None:
+    task = send(client)
+    lease(client, owner="local-opencode#2")
+
+    response = release(client, task["id"], "local-opencode#3")
+
+    assert response.status_code == 409
+    row = client.get(f"/v1/messages/{task['id']}").json()
+    assert row["state"] == "leased"
+    assert row["lease_owner"] == "local-opencode#2"
+
+
+def test_release_of_a_message_that_is_not_leased_is_rejected(client: TestClient) -> None:
+    task = send(client)
+
+    assert release(client, task["id"], "local-opencode#2").status_code == 409
+    assert client.get(f"/v1/messages/{task['id']}").json()["state"] == "queued"
+
+
+def test_release_validates_the_owner(client: TestClient) -> None:
+    task = send(client)
+
+    assert release(client, task["id"], "плохой владелец").status_code == 422
+    assert release(client, task["id"], "x" * 65).status_code == 422

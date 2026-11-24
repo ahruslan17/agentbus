@@ -108,6 +108,10 @@ class Client:
         response = self.http.post(f"/v1/messages/{message_id}/heartbeat")
         response.raise_for_status()
 
+    def release(self, message_id: str, owner: str) -> None:
+        response = self.http.post(f"/v1/messages/{message_id}/release", json={"owner": owner})
+        response.raise_for_status()
+
 
 class Heartbeat:
     """Keeps the lease, and the worker registry, alive while a long task runs."""
@@ -693,8 +697,14 @@ class Slot:
                         self.report("idle")
                     continue
                 if self.stop.is_set():
-                    # A lease returned while stopping: do not start new work here.
-                    # The lease expires on its own and the message returns to the queue.
+                    # A lease returned while stopping: give it back at once instead of
+                    # holding it until the TTL runs out. A failed release only costs a
+                    # wait, so it is logged and never raises.
+                    stopped_id = str(message.get("id"))
+                    try:
+                        self.client.release(stopped_id, self.owner)
+                    except Exception as exc:  # noqa: BLE001 - the lease expires on its own
+                        log(f"{self.owner} could not release {stopped_id}: {exc}")
                     continue
                 message_id = str(message.get("id"))
                 self.report("busy", message_id)

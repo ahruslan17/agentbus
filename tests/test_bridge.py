@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -30,8 +31,16 @@ def make_bridge(
     return Bridge(make_settings(share, state), client, share / mailbox, mailbox)
 
 
-def make_multi(client: TestClient, share: Path, state: Path) -> MultiBridge:
-    return MultiBridge(make_settings(share, state), client)
+def make_multi(
+    client: TestClient,
+    share: Path,
+    state: Path,
+    clock: Callable[[], float] | None = None,
+) -> MultiBridge:
+    settings = make_settings(share, state)
+    if clock is None:
+        return MultiBridge(settings, client)
+    return MultiBridge(settings, client, clock=clock)
 
 
 def write_mailbox_file(share: Path, mailbox: str, name: str, payload: dict) -> Path:
@@ -323,7 +332,8 @@ def test_invalid_mailbox_names_are_ignored(
 
     for mailbox in (".hidden", "Bad_Name", "x"):
         assert (share / mailbox / "outbox" / "0001.json").is_file()
-        assert not (share / mailbox / "sent").exists()
+        for name in ("sent", "failed", "inbox"):
+            assert not (share / mailbox / name).exists()
     assert client.get("/v1/inbox/local-opencode").json()["messages"] == []
 
     invalid = [line for line in capsys.readouterr().out.splitlines() if "invalid name" in line]
@@ -363,6 +373,44 @@ def test_receipt_is_written_next_to_the_sent_file(client: TestClient, tmp_path: 
     assert receipt["file"] == "0001.json"
     assert receipt["kind"] == "task"
     assert receipt["recipient"] == "local-opencode"
+
+
+def mailbox_lines(capsys: pytest.CaptureFixture[str], mailbox: str) -> list[str]:
+    return [line for line in capsys.readouterr().out.splitlines() if f"mailbox {mailbox}" in line]
+
+
+def test_broken_mailbox_errors_are_throttled_and_recovery_is_logged(
+    client: TestClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    share = tmp_path / "share"
+    beta = share / "beta"
+    beta.mkdir(parents=True)
+    (beta / "inbox").write_text("not a directory", encoding="utf-8")
+
+    now = [1000.0]
+    bridge = make_multi(client, share, tmp_path / "state", clock=lambda: now[0])
+
+    bridge.run_once()
+    bridge.run_once()
+    bridge.run_once()
+
+    first = mailbox_lines(capsys, "beta")
+    assert len(first) == 1, "the same error must not be logged on every tick"
+    assert "(repeated" not in first[0]
+
+    now[0] += 301
+    bridge.run_once()
+
+    repeated = mailbox_lines(capsys, "beta")
+    assert len(repeated) == 1
+    assert repeated[0].endswith("(repeated 2 times)")
+
+    (beta / "inbox").unlink()
+    bridge.run_once()
+
+    recovered = mailbox_lines(capsys, "beta")
+    assert len(recovered) == 1
+    assert recovered[0].endswith("mailbox beta: recovered")
 
 
 def test_broken_mailbox_does_not_stop_the_others(client: TestClient, tmp_path: Path) -> None:

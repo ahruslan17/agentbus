@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ from agentbus.config import BridgeSettings
 
 MAX_INBOX_BYTES = 5 * 1024 * 1024
 MAILBOX_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+ERROR_REPEAT_SECONDS = 300.0
 
 
 def log(message: str) -> None:
@@ -240,15 +242,33 @@ class Bridge:
         return self.pump_outbox(), self.pump_inbox(), self.pump_read()
 
 
+class _MailboxError:
+    """The last error of one mailbox, for throttling the tick-by-tick log."""
+
+    __slots__ = ("logged_at", "repeats", "signature")
+
+    def __init__(self, signature: str, logged_at: float) -> None:
+        self.signature = signature
+        self.logged_at = logged_at
+        self.repeats = 0
+
+
 class MultiBridge:
     """Serves every valid mailbox folder inside the share root as its own agent."""
 
-    def __init__(self, settings: BridgeSettings, api: Any) -> None:
+    def __init__(
+        self,
+        settings: BridgeSettings,
+        api: Any,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.settings = settings
         self.api = api
+        self.clock = clock
         self.root = Path(settings.share_root).expanduser()
         self.mailboxes: dict[str, Bridge] = {}
         self._invalid: set[str] = set()
+        self._errors: dict[str, _MailboxError] = {}
 
     def discover(self) -> list[str]:
         """Valid mailbox folders, sorted. Invalid names are logged once, not every tick."""
@@ -278,11 +298,32 @@ class MultiBridge:
                     self.mailboxes[name] = bridge
                 counts = bridge.run_once()
             except Exception as exc:  # noqa: BLE001 - one broken mailbox must not stop others
-                log(f"mailbox {name}: {exc!r}")
+                self._log_failure(name, exc)
                 continue
+            self._log_recovery(name)
             for index, count in enumerate(counts):
                 totals[index] += count
         return totals[0], totals[1], totals[2]
+
+    def _log_failure(self, name: str, exc: Exception) -> None:
+        """One line for a new error, then the same error at most once per 5 minutes."""
+        signature = repr(exc)
+        now = self.clock()
+        entry = self._errors.get(name)
+        if entry is None or entry.signature != signature:
+            self._errors[name] = _MailboxError(signature, now)
+            log(f"mailbox {name}: {signature}")
+            return
+        if now - entry.logged_at < ERROR_REPEAT_SECONDS:
+            entry.repeats += 1
+            return
+        log(f"mailbox {name}: {signature} (repeated {entry.repeats} times)")
+        entry.logged_at = now
+        entry.repeats = 0
+
+    def _log_recovery(self, name: str) -> None:
+        if self._errors.pop(name, None) is not None:
+            log(f"mailbox {name}: recovered")
 
 
 def _read_note(folder: Path) -> str:

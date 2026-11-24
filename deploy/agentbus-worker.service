@@ -9,6 +9,8 @@ ExecStart=%h/personal/agentbus/bin/agentbus-worker
 Restart=on-failure
 RestartSec=10
 KillSignal=SIGTERM
+# Only the worker gets SIGTERM; running opencode children finish within TimeoutStopSec.
+KillMode=mixed
 # Must be >= AGENTBUS_STOP_GRACE, which defaults to AGENTBUS_TASK_TIMEOUT (2400s).
 TimeoutStopSec=2460
 

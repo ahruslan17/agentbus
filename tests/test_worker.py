@@ -14,7 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agentbus.config import WorkerSettings
-from agentbus.worker import repo_lock, run_slots
+from agentbus.worker import Client, repo_lock, run_slots
 
 from .conftest import TOKEN
 
@@ -285,6 +285,38 @@ def test_stop_finishes_the_running_task_and_keeps_new_ones_queued(
 
     assert wait_state(client, running["id"])["state"] == "done"
     assert client.get(f"/v1/messages/{late['id']}").json()["state"] == "queued"
+
+
+def test_lease_returned_while_stopping_goes_back_to_the_queue_at_once(
+    tmp_path: Path,
+    repo: Path,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = worker_settings(tmp_path, repo)
+    stop = threading.Event()
+    task = send(client, repo=str(repo), body="работа")
+    original_lease = Client.lease
+
+    def lease_then_stop(self, wait, owner=None):
+        message = original_lease(self, wait=0, owner=owner)
+        stop.set()
+        return message
+
+    monkeypatch.setattr(Client, "lease", lease_then_stop)
+
+    threads = run_slots(settings, stop, http=client)
+    try:
+        join_all(threads)
+    finally:
+        stop.set()
+        join_all(threads)
+
+    # the slot released the lease itself: no TTL (60 s here) had to expire
+    row = client.get(f"/v1/messages/{task['id']}").json()
+    assert row["state"] == "queued"
+    assert row["lease_owner"] is None
+    assert row["attempt"] == 0
 
 
 def test_repo_lock_serialises_one_repo_and_allows_different_ones(tmp_path: Path) -> None:

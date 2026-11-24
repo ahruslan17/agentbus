@@ -57,6 +57,10 @@ class StateRequest(BaseModel):
     note: str | None = None
 
 
+class ReleaseRequest(BaseModel):
+    owner: str = Field(max_length=64, pattern=r"^[A-Za-z0-9._#-]+$")
+
+
 class WorkerRequest(BaseModel):
     agent: str = Field(min_length=1, max_length=64)
     host: str | None = None
@@ -274,6 +278,14 @@ def create_app(
             if row is None:
                 raise HTTPException(status_code=409, detail="not leased")
             return row
+
+    @app.post("/v1/messages/{message_id}/release", dependencies=[guard])
+    def release(message_id: str, payload: ReleaseRequest) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            row = store.release(conn, message_id=message_id, owner=payload.owner)
+        if row is None:
+            raise HTTPException(status_code=409, detail="not leased by this owner")
+        return jsonable_encoder(row)
 
     @app.get("/v1/messages/{message_id}/file", dependencies=[guard])
     def read_file(message_id: str, path: str = Query(default="")) -> dict[str, Any]:
