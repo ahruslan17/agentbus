@@ -26,6 +26,7 @@ class Settings:
     database_url: str
     token: str
     lease_ttl_seconds: int
+    per_sender_leases: int
     max_wait_seconds: int
     bind_host: str
     bind_port: int
@@ -37,6 +38,7 @@ class Settings:
             database_url=os.environ.get("AGENTBUS_DATABASE_URL", DEFAULT_DATABASE_URL),
             token=_required("AGENTBUS_TOKEN"),
             lease_ttl_seconds=_int("AGENTBUS_LEASE_TTL", 900),
+            per_sender_leases=_int("AGENTBUS_PER_SENDER_LEASES", 0),
             max_wait_seconds=_int("AGENTBUS_MAX_WAIT", 120),
             bind_host=os.environ.get("AGENTBUS_BIND_HOST", "127.0.0.1"),
             bind_port=_int("AGENTBUS_BIND_PORT", 8787),

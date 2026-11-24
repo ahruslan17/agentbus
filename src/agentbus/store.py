@@ -17,6 +17,11 @@ STATES = ("queued", "leased", "done", "failed", "cancelled")
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
+# One global mutex for the whole lease transaction (reap + pick + update). Serialising
+# leases here is cheap: a lease is a single short statement, and without the mutex two
+# executors could pick two messages of the same thread or race on the fairness count.
+LEASE_LOCK_KEY = 0x61627573  # "abus"
+
 
 @contextmanager
 def connect(database_url: str) -> Iterator[psycopg.Connection]:
@@ -145,30 +150,66 @@ def lease_message(
     agent: str,
     ttl_seconds: int,
     kinds: tuple[str, ...] | None = None,
+    owner: str | None = None,
+    per_sender_limit: int = 0,
 ) -> dict[str, Any] | None:
-    """Atomically hand the oldest queued message for `agent` to it."""
+    """Atomically hand one queued message for `agent` to it.
+
+    The whole lease (reap, pick, update) runs in the caller's transaction under
+    `LEASE_LOCK_KEY`, so the lock lives until the transaction commits. A message is only
+    handed out if nothing else in its thread is leased: one thread means one running
+    executor. Among the rest, the sender with the fewest current leases for this
+    recipient goes first, then the oldest message. `per_sender_limit > 0` caps how many
+    messages of one sender may be leased to this recipient at once.
+    """
+    if conn.autocommit:
+        raise RuntimeError("lease_message needs a transaction: connection must not be autocommit")
+    conn.execute("select pg_advisory_xact_lock(%s::bigint)", (LEASE_LOCK_KEY,))
     reap_expired_leases(conn)
+
     kind_filter = ""
-    params: list[Any] = [agent, ttl_seconds, agent]
+    params: dict[str, Any] = {
+        "agent": agent,
+        "owner": owner or agent,
+        "ttl": ttl_seconds,
+        "limit": per_sender_limit,
+    }
     if kinds:
-        kind_filter = "and kind = any(%s)"
-        params.append(list(kinds))
+        kind_filter = "and m.kind = any(%(kinds)s)"
+        params["kinds"] = list(kinds)
 
     row = conn.execute(
         f"""
+        with candidates as (
+            select m.id, m.sender, m.created_at,
+                   (select count(*)
+                      from messages held
+                     where held.recipient = %(agent)s
+                       and held.state = 'leased'
+                       and held.sender = m.sender) as sender_leases
+              from messages m
+             where m.recipient = %(agent)s
+               and m.state = 'queued'
+               {kind_filter}
+               and (m.thread_id is null
+                    or not exists (select 1
+                                     from messages busy
+                                    where busy.thread_id = m.thread_id
+                                      and busy.state = 'leased'))
+        )
         update messages
            set state = 'leased',
-               lease_owner = %s,
-               lease_until = now() + make_interval(secs => %s),
+               lease_owner = %(owner)s,
+               lease_until = now() + make_interval(secs => %(ttl)s),
                attempt = attempt + 1,
                updated_at = now()
          where id = (
-               select id from messages
-                where recipient = %s and state = 'queued' {kind_filter}
-                order by created_at
-                  for update skip locked
+               select id from candidates
+                where %(limit)s <= 0 or sender_leases < %(limit)s
+                order by sender_leases, created_at, id
                 limit 1
          )
+           and state = 'queued'
         returning *
         """,
         params,

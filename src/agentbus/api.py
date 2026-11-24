@@ -101,13 +101,26 @@ def create_app(settings: Settings) -> FastAPI:
         agent: str,
         wait: int = Query(default=0, ge=0, le=300),
         kinds: str | None = Query(default=None, description="comma separated kinds"),
+        owner: str | None = Query(
+            default=None,
+            max_length=64,
+            pattern=r"^[A-Za-z0-9._#-]+$",
+            description="lease owner, e.g. local-opencode#2; defaults to agent",
+        ),
     ):
         wanted = tuple(k.strip() for k in kinds.split(",") if k.strip()) if kinds else None
         ttl = current_settings().lease_ttl_seconds
         deadline = time.monotonic() + min(wait, current_settings().max_wait_seconds)
         while True:
             with store.connect(current_settings().database_url) as conn:
-                row = store.lease_message(conn, agent=agent, ttl_seconds=ttl, kinds=wanted)
+                row = store.lease_message(
+                    conn,
+                    agent=agent,
+                    ttl_seconds=ttl,
+                    kinds=wanted,
+                    owner=owner,
+                    per_sender_limit=current_settings().per_sender_leases,
+                )
             if row is not None:
                 return jsonable_encoder(row)
             if time.monotonic() >= deadline:

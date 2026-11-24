@@ -56,6 +56,7 @@ def settings(clean: None, artifacts: str) -> Settings:
         database_url=TEST_URL,
         token=TOKEN,
         lease_ttl_seconds=60,
+        per_sender_leases=0,
         max_wait_seconds=1,
         bind_host="127.0.0.1",
         bind_port=0,
