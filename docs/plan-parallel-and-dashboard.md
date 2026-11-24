@@ -163,7 +163,8 @@ N потоков, каждый — текущий цикл `lease → handle`. `
 | T3b | миграция `events` + `workers`, запись событий в `store`, `pg_notify` + тесты | — |
 | T4 | worker: N слотов, `lease_owner` со слотом, регистрация в `workers`, locks по репо, корректная остановка + тесты (`tests/test_worker.py` с фейковым opencode) | T3, T3b |
 | T4b | worker: **коммит результата в ветку треда** (сейчас только `git add -A`, ветка пустая, а самокоммит исполнителя даёт пустой патч), накопленный `patch.diff` + `attempt.diff`, построчный flush `run.log`, сумма токенов, `model`/`harness` в meta + тесты | T4 |
-| T5 | API для дашборда: GET-эндпоинты, парсер `run.log`, SSE с общим LISTEN, cookie-вход, проверка Host + тесты | T3b |
+| T5 | API для дашборда: GET-эндпоинты (overview, mailboxes, threads, timeline, log, stats), парсер `run.log`, cookie-вход, проверка Host + тесты | T3b, T4 |
+| T5b | SSE `/v1/stream`: один общий LISTEN, fan-out, `Last-Event-ID`, keepalive + тесты | T5 |
 | T6 | UI v1: страницы «Сейчас», «Тред» (таймлайн, дифф, живая лента) | T5 |
 | T7 | UI v1: «Ящики», «История», «Статистика» | T5 |
 | T8 | хвосты ревью T1: в тесте невалидных ящиков проверить, что `sent/` не создан; троттлинг лога ошибки сломанного ящика (сейчас строка каждые 2 с); ревью T4: lease, вернувшийся во время остановки, висит `leased` до TTL — эндпоинт «вернуть в очередь» (`POST /v1/messages/{id}/release`) и вызов его из слота. SKILL.md (параллельная раздача тикетов, вердикты), README, `.env.example`, systemd, `make prune`, smoke: 2 ящика × 2 параллельных тикета + дашборд показывает оба | T1–T7 |
