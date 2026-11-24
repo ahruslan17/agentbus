@@ -332,3 +332,25 @@ def test_host_guard_and_browser_login(settings) -> None:
     assert page.status_code == 200
     assert "agentbus" in page.text
     assert "UI — T6" in page.text
+
+
+# 10
+def test_log_tail_waits_for_the_unfinished_last_line(client: TestClient, artifacts: str) -> None:
+    task = send(client)
+    directory = Path(artifacts) / task["id"]
+    directory.mkdir(parents=True)
+    done = json.dumps(
+        {"type": "text", "timestamp": 1, "part": {"text": "готово", "time": {"end": 1}}}
+    )
+    pending = json.dumps({"type": "step_finish", "part": {"tokens": {"input": 1, "output": 2}}})
+    log = directory / "run.log"
+    log.write_text(done + "\n" + pending, encoding="utf-8")
+
+    first = client.get(f"/v1/messages/{task['id']}/log").json()
+    assert [row["type"] for row in first["lines"]] == ["text"]
+    assert first["next"] == 1
+
+    log.write_text(done + "\n" + pending + "\n", encoding="utf-8")
+    rest = client.get(f"/v1/messages/{task['id']}/log", params={"after": first["next"]}).json()
+    assert [row["type"] for row in rest["lines"]] == ["step"]
+    assert rest["next"] == 2

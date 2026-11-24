@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import secrets
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi import Path as PathParam
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from agentbus import runlog, store
+from agentbus import live, runlog, store
 from agentbus.config import Settings
 
 MAX_FILE_BYTES = 256 * 1024
@@ -23,6 +27,9 @@ POLL_INTERVAL = 0.25
 WORKER_ID_PATTERN = r"^[A-Za-z0-9._#-]+$"
 UI_DIR = Path(__file__).resolve().parent / "ui"
 TOKEN_COOKIE = "agentbus_token"
+STREAM_BACKLOG = 500
+STREAM_KEEPALIVE_SECONDS = 15.0
+STREAM_READY_SECONDS = 5.0
 
 
 class SendRequest(BaseModel):
@@ -60,10 +67,21 @@ class WorkerRequest(BaseModel):
     message_id: str | None = None
 
 
-def create_app(settings: Settings) -> FastAPI:
-    app = FastAPI(title="agentbus", version="0.1.0")
+def create_app(
+    settings: Settings, *, stream_keepalive_seconds: float = STREAM_KEEPALIVE_SECONDS
+) -> FastAPI:
+    hub = live.Hub(settings.database_url)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        yield
+        await asyncio.to_thread(hub.close)
+
+    app = FastAPI(title="agentbus", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.artifacts_dir = Path(settings.artifacts_dir).expanduser()
+    app.state.live = hub
+    app.state.stream_keepalive_seconds = stream_keepalive_seconds
     allowed_hosts = set(_allowed_hosts(settings))
 
     def current_settings() -> Settings:
@@ -155,6 +173,21 @@ def create_app(settings: Settings) -> FastAPI:
     ) -> dict[str, Any]:
         with store.connect(current_settings().database_url) as conn:
             return {"events": store.recent_events(conn, after_id=after, limit=limit)}
+
+    @app.get("/v1/stream", dependencies=[guard])
+    async def stream(
+        last_event_id: Annotated[str | None, Header()] = None,
+    ) -> StreamingResponse:
+        return StreamingResponse(
+            _event_source(
+                hub=hub,
+                database_url=current_settings().database_url,
+                after=_cursor(last_event_id),
+                keepalive=app.state.stream_keepalive_seconds,
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.put("/v1/workers/{worker_id}", dependencies=[guard])
     def put_worker(
@@ -353,6 +386,80 @@ def create_app(settings: Settings) -> FastAPI:
     return app
 
 
+async def _event_source(
+    *, hub: live.Hub, database_url: str, after: int | None, keepalive: float
+) -> AsyncIterator[str]:
+    """SSE frames: hello, then replayed events, then live notifications and pings."""
+    queue = hub.subscribe()
+    try:
+        await asyncio.to_thread(hub.wait_ready, STREAM_READY_SECONDS)
+        last_event_id, backlog = await asyncio.to_thread(_stream_snapshot, database_url, after)
+        yield _sse(None, "hello", {"last_event_id": last_event_id})
+        sent = last_event_id if after is None else min(after, last_event_id)
+        for row in backlog:
+            sent = row["id"]
+            yield _sse(row["id"], "agentbus", _notify_payload(row))
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=keepalive)
+            except TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if item is live.CLOSED:
+                return
+            if not isinstance(item, dict):
+                continue
+            event_id = item.get("event_id")
+            if isinstance(event_id, int):
+                if event_id <= sent:
+                    continue
+                sent = event_id
+            yield _sse(event_id if isinstance(event_id, int) else None, "agentbus", item)
+    finally:
+        hub.unsubscribe(queue)
+
+
+def _sse(event_id: int | None, event: str, payload: dict[str, Any]) -> str:
+    lines: list[str] = []
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"event: {event}")
+    lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _notify_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape a journal row like the `pg_notify` payload the live channel sends."""
+    return {
+        "event_id": row["id"],
+        "kind": row["kind"],
+        "message_id": row.get("message_id"),
+        "thread_id": row.get("thread_id"),
+    }
+
+
+def _stream_snapshot(database_url: str, after: int | None) -> tuple[int, list[dict[str, Any]]]:
+    """Latest journal id and the events missed since `after` (at most STREAM_BACKLOG)."""
+    with store.connect(database_url) as conn:
+        last_event_id = store.max_event_id(conn)
+        backlog = (
+            store.recent_events(conn, after_id=after, limit=STREAM_BACKLOG)
+            if after is not None
+            else []
+        )
+    return last_event_id, backlog
+
+
+def _cursor(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
 def _allowed_hosts(settings: Settings) -> tuple[str, ...]:
     if settings.allowed_hosts:
         return settings.allowed_hosts
@@ -380,11 +487,17 @@ def _run_log_path(root: Path, conn, message_id: str) -> Path | None:
 
 
 def _read_log_lines(path: Path, after: int) -> list[str]:
-    """Read at most MAX_LOG_BYTES of the tail, starting at file line `after`."""
+    """Read at most MAX_LOG_BYTES of the tail, starting at file line `after`.
+
+    A last line without a trailing newline is still being written: it is skipped and
+    not counted, so the next request returns it once the writer finishes the line.
+    """
     selected: list[str] = []
     size = 0
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for index, line in enumerate(handle):
+            if not line.endswith("\n"):
+                break
             if index < after:
                 continue
             grown = size + len(line.encode("utf-8"))

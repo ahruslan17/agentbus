@@ -337,6 +337,12 @@ def recent_events(
     ).fetchall()
 
 
+def max_event_id(conn: psycopg.Connection) -> int:
+    """Latest journal id, or 0 on an empty journal. Used as the SSE hello cursor."""
+    row = conn.execute("select coalesce(max(id), 0) as id from events").fetchone()
+    return int(row["id"]) if row is not None else 0
+
+
 def reply(
     conn: psycopg.Connection,
     *,
