@@ -5,9 +5,10 @@ from __future__ import annotations
 import secrets
 import time
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Path as PathParam
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
@@ -16,6 +17,7 @@ from agentbus.config import Settings
 
 MAX_FILE_BYTES = 256 * 1024
 POLL_INTERVAL = 0.25
+WORKER_ID_PATTERN = r"^[A-Za-z0-9._#-]+$"
 
 
 class SendRequest(BaseModel):
@@ -41,6 +43,16 @@ class ReplyRequest(BaseModel):
 class StateRequest(BaseModel):
     state: str
     note: str | None = None
+
+
+class WorkerRequest(BaseModel):
+    agent: str = Field(min_length=1, max_length=64)
+    host: str | None = None
+    pid: int | None = Field(default=None, ge=0)
+    model: str | None = None
+    harness: str | None = None
+    state: Literal["idle", "busy", "stopping", "stopped"]
+    message_id: str | None = None
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -95,6 +107,36 @@ def create_app(settings: Settings) -> FastAPI:
     def list_inbox(agent: str, limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
         with store.connect(current_settings().database_url) as conn:
             return {"messages": store.inbox(conn, agent=agent, limit=limit)}
+
+    @app.get("/v1/threads/{thread_id}/events", dependencies=[guard])
+    def thread_events(thread_id: str) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return {"events": store.thread_events(conn, thread_id)}
+
+    @app.get("/v1/events", dependencies=[guard])
+    def events(
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return {"events": store.recent_events(conn, after_id=after, limit=limit)}
+
+    @app.put("/v1/workers/{worker_id}", dependencies=[guard])
+    def put_worker(
+        payload: WorkerRequest,
+        worker_id: Annotated[str, PathParam(max_length=64, pattern=WORKER_ID_PATTERN)],
+    ) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return store.upsert_worker(conn, id=worker_id, **payload.model_dump())
+
+    @app.get("/v1/workers", dependencies=[guard])
+    def workers() -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return {
+                "workers": store.list_workers(
+                    conn, lease_ttl_seconds=current_settings().lease_ttl_seconds
+                )
+            }
 
     @app.post("/v1/inbox/{agent}/lease", dependencies=[guard])
     def lease(

@@ -40,7 +40,7 @@ def database() -> None:
 @pytest.fixture()
 def clean(database: None) -> None:
     with store.connect(TEST_URL) as conn:
-        conn.execute("truncate messages, threads cascade")
+        conn.execute("truncate messages, threads, events, workers cascade")
 
 
 @pytest.fixture()
