@@ -9,15 +9,21 @@ One thread == one git worktree == one branch == one OpenCode session, so a revie
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Self
+from urllib.parse import quote
 
 import httpx
 
@@ -31,27 +37,51 @@ def log(message: str) -> None:
 
 
 class Client:
-    def __init__(self, settings: WorkerSettings) -> None:
+    def __init__(self, settings: WorkerSettings, http: httpx.Client | None = None) -> None:
         self.settings = settings
-        self.http = httpx.Client(
-            base_url=settings.url,
-            headers={"Authorization": f"Bearer {settings.token}"},
-            timeout=120.0,
+        self._owns_http = http is None
+        self.http = (
+            http
+            if http is not None
+            else httpx.Client(
+                base_url=settings.url,
+                headers={"Authorization": f"Bearer {settings.token}"},
+                timeout=120.0,
+            )
         )
 
     def close(self) -> None:
-        self.http.close()
+        if self._owns_http:
+            self.http.close()
 
-    def lease(self, wait: int) -> dict[str, Any] | None:
+    def lease(self, wait: int, owner: str | None = None) -> dict[str, Any] | None:
+        params: dict[str, Any] = {"wait": wait, "kinds": ",".join(EXECUTABLE_KINDS)}
+        if owner is not None:
+            params["owner"] = owner
         response = self.http.post(
             f"/v1/inbox/{self.settings.agent}/lease",
-            params={"wait": wait, "kinds": ",".join(EXECUTABLE_KINDS)},
+            params=params,
             timeout=wait + 60,
         )
         if response.status_code == 204:
             return None
         response.raise_for_status()
         return response.json()
+
+    def report_worker(self, owner: str, state: str, message_id: str | None = None) -> None:
+        response = self.http.put(
+            f"/v1/workers/{quote(owner, safe='')}",
+            json={
+                "agent": self.settings.agent,
+                "host": socket.gethostname(),
+                "pid": os.getpid(),
+                "model": self.settings.model,
+                "harness": "opencode",
+                "state": state,
+                "message_id": message_id,
+            },
+        )
+        response.raise_for_status()
 
     def thread(self, thread_id: str) -> dict[str, Any]:
         response = self.http.get(f"/v1/threads/{thread_id}")
@@ -80,12 +110,19 @@ class Client:
 
 
 class Heartbeat:
-    """Keeps the lease alive while a long task runs."""
+    """Keeps the lease, and the worker registry, alive while a long task runs."""
 
-    def __init__(self, client: Client, message_id: str, interval: int) -> None:
+    def __init__(
+        self,
+        client: Client,
+        message_id: str,
+        interval: int,
+        slot: Slot | None = None,
+    ) -> None:
         self.client = client
         self.message_id = message_id
         self.interval = max(15, interval)
+        self.slot = slot
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -95,6 +132,8 @@ class Heartbeat:
                 self.client.heartbeat(self.message_id)
             except Exception as exc:  # noqa: BLE001 - heartbeat must never kill the task
                 log(f"heartbeat failed: {exc}")
+            if self.slot is not None:
+                self.slot.report("busy", self.message_id)
 
     def __enter__(self) -> Self:
         self._thread.start()
@@ -146,6 +185,27 @@ def resolve_repo(
             raise RuntimeError(f"not a git repository: {repo}")
         return repo
     return None
+
+
+@contextmanager
+def repo_lock(settings: WorkerSettings, repo: Path, name: str) -> Iterator[None]:
+    """Serialise work on one repository; `flock` also holds between processes.
+
+    Parallel `git worktree add` in one repository races on `.git/*.lock`, and two
+    `make check` runs may fight over the same build state. The lock is per absolute
+    repository path, so different repositories still run in parallel.
+    """
+    lock_dir = Path(settings.state_dir).expanduser() / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(str(Path(repo).resolve()).encode("utf-8")).hexdigest()[:16]
+    path = lock_dir / f"{digest}.lock"
+    with path.open("w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        log(f"repo lock {name}: {repo}")
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def prepare_worktree(
@@ -215,6 +275,7 @@ def run_opencode(
     cwd: Path,
     session_id: str | None,
     raw_log: Path,
+    on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
 ) -> dict[str, Any]:
     command = [
         settings.opencode_bin,
@@ -250,6 +311,8 @@ def run_opencode(
 
     reader = threading.Thread(target=pump, daemon=True)
     reader.start()
+    if on_process is not None:
+        on_process(process)
 
     timed_out = False
     try:
@@ -261,6 +324,8 @@ def run_opencode(
     finally:
         reader.join(timeout=30)
         sink.close()
+        if on_process is not None:
+            on_process(None)
 
     duration = round(time.monotonic() - started, 1)
     parsed = _parse_events(raw_log, session_id)
@@ -349,7 +414,12 @@ def run_checks(worktree: Path, artifacts: Path) -> dict[str, Any]:
     return {"ok": result.returncode == 0, "exit_code": result.returncode, "tail": tail[-2000:]}
 
 
-def handle(settings: WorkerSettings, client: Client, message: dict[str, Any]) -> None:
+def handle(
+    settings: WorkerSettings,
+    client: Client,
+    message: dict[str, Any],
+    slot: Slot | None = None,
+) -> None:
     message_id = str(message["id"])
     meta = dict(message.get("meta") or {})
     artifacts = Path(settings.state_dir).expanduser() / "artifacts" / message_id
@@ -359,7 +429,8 @@ def handle(settings: WorkerSettings, client: Client, message: dict[str, Any]) ->
     repo = resolve_repo(settings, message, thread)
 
     if repo is not None:
-        worktree, branch = prepare_worktree(settings, message, repo)
+        with repo_lock(settings, repo, "worktree"):
+            worktree, branch = prepare_worktree(settings, message, repo)
         session_id = thread.get("session_id")
     else:
         worktree = (
@@ -376,8 +447,15 @@ def handle(settings: WorkerSettings, client: Client, message: dict[str, Any]) ->
     )
     log(f"{message_id} {message['kind']} from {message['sender']}: {worktree}")
 
-    with Heartbeat(client, message_id, settings.lease_ttl_seconds // 3):
-        outcome = run_opencode(settings, prompt, worktree, session_id, artifacts / "run.log")
+    with Heartbeat(client, message_id, settings.lease_ttl_seconds // 3, slot=slot):
+        outcome = run_opencode(
+            settings,
+            prompt,
+            worktree,
+            session_id,
+            artifacts / "run.log",
+            on_process=slot.on_process if slot is not None else None,
+        )
 
         result_meta: dict[str, Any] = {
             "worktree": str(worktree) if repo is not None else None,
@@ -395,7 +473,11 @@ def handle(settings: WorkerSettings, client: Client, message: dict[str, Any]) ->
             result_meta.update(collect_diff(worktree, artifacts))
             result_meta["artifacts"].append("patch.diff")
             if meta.get("checks"):
-                result_meta["checks"] = run_checks(worktree, artifacts)
+                if meta.get("checks_parallel"):
+                    result_meta["checks"] = run_checks(worktree, artifacts)
+                else:
+                    with repo_lock(settings, repo, "checks"):
+                        result_meta["checks"] = run_checks(worktree, artifacts)
                 result_meta["artifacts"].append("checks.txt")
 
         body = outcome.get("text") or "(пустой отчёт: агент не вернул текст)"
@@ -422,32 +504,151 @@ def _relocate_artifacts(artifacts: Path, reply_id: str) -> None:
         log(f"could not move artifacts to {reply_id}: {exc}")
 
 
+class Slot:
+    """One executor thread: its own client and lease owner, plus the process it runs."""
+
+    def __init__(
+        self,
+        settings: WorkerSettings,
+        index: int,
+        stop: threading.Event,
+        http: httpx.Client | None = None,
+    ) -> None:
+        self.settings = settings
+        self.owner = f"{settings.agent}#{index}"
+        self.stop = stop
+        self.client = Client(settings, http=http)
+        self._process_lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+        self._busy = False
+
+    def report(self, state: str, message_id: str | None = None) -> None:
+        """Registry updates are best effort: they must never stop a slot or a task."""
+        try:
+            self.client.report_worker(self.owner, state, message_id)
+        except Exception as exc:  # noqa: BLE001 - the queue stays the source of truth
+            log(f"{self.owner} registry {state} failed: {exc}")
+
+    def on_process(self, process: subprocess.Popen[str] | None) -> None:
+        with self._process_lock:
+            self._process = process
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def kill(self) -> None:
+        with self._process_lock:
+            process = self._process
+        if process is None or process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            log(f"{self.owner} could not kill {process.pid}: {exc}")
+
+    def run(self) -> None:
+        self.report("idle")
+        try:
+            while not self.stop.is_set():
+                try:
+                    message = self.client.lease(wait=60, owner=self.owner)
+                except httpx.HTTPError as exc:
+                    log(f"{self.owner} lease failed: {exc}")
+                    self.stop.wait(5)
+                    continue
+                except Exception as exc:  # noqa: BLE001 - a slot must survive API hiccups
+                    log(f"{self.owner} lease failed: {exc}")
+                    self.stop.wait(5)
+                    continue
+                if message is None:
+                    if not self.stop.is_set():
+                        self.report("idle")
+                    continue
+                if self.stop.is_set():
+                    # A lease returned while stopping: do not start new work here.
+                    # The lease expires on its own and the message returns to the queue.
+                    continue
+                message_id = str(message.get("id"))
+                self.report("busy", message_id)
+                self._busy = True
+                try:
+                    handle(self.settings, self.client, message, slot=self)
+                except Exception as exc:  # noqa: BLE001 - one bad task must not stop the slot
+                    log(f"{message_id} failed: {exc}")
+                    try:
+                        self.client.fail(message_id, f"{type(exc).__name__}: {exc}")
+                    except httpx.HTTPError as inner:
+                        log(f"could not report failure: {inner}")
+                finally:
+                    self._busy = False
+                if not self.stop.is_set():
+                    self.report("idle")
+        finally:
+            self.report("stopping")
+            self.report("stopped")
+            self.client.close()
+
+
+def run_slots(
+    settings: WorkerSettings,
+    stop: threading.Event,
+    http: httpx.Client | None = None,
+) -> list[threading.Thread]:
+    """Start one thread per configured slot and return them for joining."""
+    threads: list[threading.Thread] = []
+    for index in range(settings.slots):
+        slot = Slot(settings, index, stop, http=http)
+        thread = threading.Thread(target=slot.run, name=slot.owner, daemon=True)
+        thread.slot = slot  # type: ignore[attr-defined]
+        thread.start()
+        threads.append(thread)
+    return threads
+
+
 def main() -> int:
     settings = WorkerSettings.from_env()
-    client = Client(settings)
-    log(f"agent={settings.agent} url={settings.url} model={settings.model}")
+    stop = threading.Event()
+    log(f"agent={settings.agent} url={settings.url} model={settings.model} slots={settings.slots}")
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        stop.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    threads = run_slots(settings, stop)
+    slots: list[Slot] = [thread.slot for thread in threads]  # type: ignore[attr-defined]
+    deadline: float | None = None
     try:
         while True:
-            try:
-                message = client.lease(wait=60)
-            except httpx.HTTPError as exc:
-                log(f"lease failed: {exc}")
-                time.sleep(5)
+            if stop.is_set() and deadline is None:
+                running = sum(1 for slot in slots if slot.busy)
+                log(f"stopping, waiting for {running} running tasks")
+                deadline = time.monotonic() + settings.stop_grace_seconds
+            if not any(thread.is_alive() for thread in threads):
+                break
+            if not stop.is_set():
+                time.sleep(0.2)
                 continue
-            if message is None:
-                continue
-            try:
-                handle(settings, client, message)
-            except Exception as exc:  # noqa: BLE001 - one bad task must not stop the worker
-                log(f"{message.get('id')} failed: {exc}")
-                try:
-                    client.fail(str(message.get("id")), f"{type(exc).__name__}: {exc}")
-                except httpx.HTTPError as inner:
-                    log(f"could not report failure: {inner}")
+            assert deadline is not None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log("grace expired, killing running opencode processes")
+                for slot in slots:
+                    slot.kill()
+                for thread in threads:
+                    thread.join(timeout=5)
+                break
+            for thread in threads:
+                thread.join(timeout=min(0.5, remaining))
     except KeyboardInterrupt:
-        log("stopped")
-    finally:
-        client.close()
+        stop.set()
+        for slot in slots:
+            slot.kill()
+    log("stopped")
     return 0
 
 

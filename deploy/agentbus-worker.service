@@ -8,7 +8,9 @@ Type=simple
 ExecStart=%h/personal/agentbus/bin/agentbus-worker
 Restart=on-failure
 RestartSec=10
-TimeoutStopSec=30
+KillSignal=SIGTERM
+# Must be >= AGENTBUS_STOP_GRACE, which defaults to AGENTBUS_TASK_TIMEOUT (2400s).
+TimeoutStopSec=2460
 
 [Install]
 WantedBy=default.target

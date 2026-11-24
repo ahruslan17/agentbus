@@ -92,6 +92,8 @@ class WorkerSettings:
     lease_ttl_seconds: int
     opencode_bin: str
     extra_instructions: str
+    slots: int
+    stop_grace_seconds: int
 
     @classmethod
     def from_env(cls) -> WorkerSettings:
@@ -100,6 +102,7 @@ class WorkerSettings:
         )
         if not repos:
             raise RuntimeError("AGENTBUS_REPOS is required (comma separated allowed prefixes)")
+        task_timeout = _int("AGENTBUS_TASK_TIMEOUT", 2400)
         return cls(
             url=os.environ.get("AGENTBUS_URL", "http://127.0.0.1:8787").rstrip("/"),
             token=_required("AGENTBUS_TOKEN"),
@@ -109,8 +112,10 @@ class WorkerSettings:
             state_dir=os.path.expanduser(
                 os.environ.get("AGENTBUS_STATE_DIR", "~/.local/state/agentbus")
             ),
-            task_timeout_seconds=_int("AGENTBUS_TASK_TIMEOUT", 2400),
+            task_timeout_seconds=task_timeout,
             lease_ttl_seconds=_int("AGENTBUS_LEASE_TTL", 900),
             opencode_bin=os.environ.get("AGENTBUS_OPENCODE_BIN", "opencode"),
             extra_instructions=os.environ.get("AGENTBUS_POLICY", ""),
+            slots=max(1, _int("AGENTBUS_WORKER_SLOTS", 1)),
+            stop_grace_seconds=_int("AGENTBUS_STOP_GRACE", task_timeout),
         )
