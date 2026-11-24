@@ -94,20 +94,37 @@ worktree = одна ветка `agentbus/<thread_id>` = одна сессия Op
 пропускает. `AGENTBUS_BRIDGE_AGENT` больше не используется: агент всегда равен имени
 папки.
 
+`cb` сам находит свой ящик, по приоритету:
+
+1. `AGENTBUS_SHARE` — полный путь к папке ящика;
+2. `AGENTBUS_MAILBOX=<имя>` — `<корень>/<имя>`;
+3. внутри git-репозитория — `claude-<имя папки репозитория>`: lower-case, всё кроме
+   `[a-z0-9-]` заменяется на `-`, повторы схлопываются, до 33 символов
+   (`My_Repo.v2` → `claude-my-repo-v2`);
+4. иначе `cage-claude` — старые настройки продолжают работать.
+
+Две сессии в разных продуктах разводятся без настройки. `cb env` печатает выбранные
+`mailbox` и `source`, `cb init [имя]` создаёт ящик (`outbox/ inbox/ sent/ read/`) и
+печатает путь. `send`, `reply` и `init` создают папку сами, остальные команды на
+отсутствующий ящик ругаются.
+
 В cage нужен только `bin/cb` и `python3`; jq, curl и токен там не нужны — сетевого
 доступа у моста нет по построению:
 
 ```bash
 export AGENTBUS_SHARE=/mnt/cage-bridge/cage-claude
 
+cb init
 cb send --to local-opencode --repo /home/ruslan/personal/real-inflation \
-        --meta '{"acceptance":["make check зелёный"],"checks":true}' \
-        "Реализуй T1 по docs/specs/T1.md"
+        --meta '{"acceptance":["make check зелёный"],"checks":true,"ticket":"T2"}' \
+        "Реализуй T2 по docs/specs/T2.md"      # в выводе id и thread_id
 
 cb inbox                  # что пришло
-cb show m_... --text      # сообщение и diff_stat
+cb show m_... --text      # сообщение, тикет и diff_stat
 cb patch m_...            # сам diff
-cb reply m_... --kind verdict "правь X"
+cb wait m_... [m_...] [--all] [--timeout 600]   # ответы по parent_id
+cb reply m_... --kind verdict "правь X"   # meta.decision = "rework"
+cb accept m_... --note "принято"          # decision.json + перенос в read/
 cb read m_...             # убрать из inbox
 ```
 
@@ -118,8 +135,23 @@ cb read m_...             # убрать из inbox
 
 После успешной отправки рядом с файлом появляется квитанция
 `sent/<stem>.receipt.json` с `id` и `thread_id`: мастер узнаёт id сообщения, не заглядывая
-в API. Отправитель всегда принудительно равен имени ящика — подписаться чужим ящиком
-нельзя.
+в API. `cb send` и `cb reply` ждут её (`--wait-id`, по умолчанию 15 секунд, `0` — не
+ждать) и печатают `id` и `thread_id` в том же JSON. Если квитанции нет — печатается всё,
+что известно, плюс предупреждение в stderr, код выхода 0; если файл уехал в `failed/` —
+печатается текст `.error` и код выхода 1. Отправитель всегда принудительно равен имени
+ящика — подписаться чужим ящиком нельзя.
+
+`cb wait <id> ...` ждёт в `inbox/` ответы с `parent_id` из переданных id: по умолчанию
+возвращается после первого, с `--all` — после всех, `--timeout` (по умолчанию 3600
+секунд) завершает с кодом 2. Строка ответа содержит тикет, `checks=ok|fail|-` и
+`timeout=true|false`.
+
+`meta.ticket` отправленного сообщения виден в `cb inbox` и `cb show --text` для ответов
+на него: связь идёт по цепочке `parent_id` → квитанция в `sent/` → исходный файл.
+Вердикт, отправленный через `cb reply --kind verdict`, по умолчанию получает
+`meta.decision = "rework"` и наследует `ticket` от сообщения, на которое отвечает.
+`cb accept <id>` пишет `read/<id>/decision.json` и переносит папку в `read/`; мост
+закрывает сообщение заметкой `accept` или `accept: <note>` вместо `read in the VM`.
 
 Доставка идемпотентна: имя файла в `outbox` становится ключом идемпотентности, а
 признак «уже доставлено» хранится на хосте, поэтому рестарт моста ничего не дублирует.

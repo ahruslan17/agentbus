@@ -224,7 +224,7 @@ class Bridge:
             try:
                 response = self.api.post(
                     f"/v1/messages/{message_id}/state",
-                    json={"state": "done", "note": "read in the VM"},
+                    json={"state": "done", "note": _read_note(folder)},
                 )
             except httpx.HTTPError as exc:
                 log(f"ack {message_id} failed: {exc}")
@@ -283,6 +283,18 @@ class MultiBridge:
             for index, count in enumerate(counts):
                 totals[index] += count
         return totals[0], totals[1], totals[2]
+
+
+def _read_note(folder: Path) -> str:
+    """`cb accept` leaves decision.json next to the message: say that instead of "read"."""
+    try:
+        decision = json.loads((folder / "decision.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return "read in the VM"
+    if not isinstance(decision, dict) or not decision.get("decision"):
+        return "read in the VM"
+    note = str(decision.get("note") or "").strip()
+    return f"accept: {note}" if note else "accept"
 
 
 def _unique(path: Path) -> Path:

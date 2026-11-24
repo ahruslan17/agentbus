@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """cb — agentbus client for a VM that has no network access, only a shared directory.
 
-Everything it does is files inside $AGENTBUS_SHARE (the agent's own folder in the share):
+Everything it does is files inside the agent's own mailbox folder in the share:
 
+    cb init                          # create the mailbox (or `cb init my-name`)
     cb send --to local-opencode --repo /path/to/repo "сделай X"   # -> outbox/
     cb inbox                                                      # new messages
     cb show m_...                                                 # message.json
     cb body m_... | cb patch m_...                                 # text / diff
     cb reply m_... --kind verdict "правь Y"                        # -> outbox/
+    cb wait m_... [--all] [--timeout 600]                          # answers by parent_id
+    cb accept m_... [--note "..."]                                 # accept a result
     cb read m_...                                                  # move to read/
 
-Only the standard library is used, so it runs anywhere python3 exists.
+The mailbox is picked in this order:
+
+1. ``AGENTBUS_SHARE`` — full path to the mailbox folder;
+2. ``AGENTBUS_MAILBOX=<name>`` — ``<root>/<name>``;
+3. inside a git repository — ``claude-<normalized repo folder name>``;
+4. otherwise ``cage-claude`` (backward compatibility).
+
+``<root>`` is ``AGENTBUS_SHARE_ROOT`` or the ``.agentbus`` folder next to this
+checkout. Only the standard library is used, so it runs anywhere python3 exists.
 """
 
 from __future__ import annotations
@@ -18,30 +29,87 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import time
 import uuid
 from pathlib import Path
 
+MAILBOX_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+DEFAULT_MAILBOX = "cage-claude"
 
-def share() -> Path:
-    """AGENTBUS_SHARE wins; otherwise the share sits next to this checkout.
 
-    <...>/agentbus/bin/cb  ->  <...>/.agentbus/cage-claude
+def share_root() -> Path:
+    """The folder that holds every mailbox: AGENTBUS_SHARE_ROOT or next to this checkout."""
+    raw = os.environ.get("AGENTBUS_SHARE_ROOT", "").strip()
+    if raw:
+        return Path(os.path.expanduser(raw))
+    here = Path(os.path.realpath(__file__))
+    return here.parents[2] / ".agentbus"
 
-    The same spelling holds in the VM, because Cage mounts a project folder at
-    its own host path, so no per-side configuration is needed.
-    """
+
+def normalize_mailbox(raw: str) -> str:
+    """``My_Repo.v2`` -> ``my-repo-v2``: lower-case, [a-z0-9-] only, no repeats, 33 chars."""
+    name = re.sub(r"[^a-z0-9-]", "-", raw.lower())
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name[:33].strip("-")
+
+
+def git_toplevel() -> Path | None:
+    """Found by walking up to ``.git``; git itself is not available in the VM."""
+    try:
+        current = Path.cwd().resolve()
+    except OSError:
+        return None
+    for path in (current, *current.parents):
+        if (path / ".git").exists():
+            return path
+    return None
+
+
+def require_name(name: str) -> str:
+    if not MAILBOX_NAME.fullmatch(name):
+        sys.exit(f"cb: invalid mailbox name: {name!r}\n"
+                 f"cb: expected ^[a-z0-9][a-z0-9-]{{1,40}}$")
+    return name
+
+
+def resolve_share() -> tuple[Path, str, str]:
+    """Return (mailbox path, mailbox name, which rule matched)."""
     raw = os.environ.get("AGENTBUS_SHARE", "").strip()
     if raw:
-        root = Path(os.path.expanduser(raw))
-    else:
-        here = Path(os.path.realpath(__file__))
-        root = here.parents[2] / ".agentbus" / "cage-claude"
+        path = Path(os.path.expanduser(raw))
+        return path, path.name, "AGENTBUS_SHARE"
+
+    root = share_root()
+    name = os.environ.get("AGENTBUS_MAILBOX", "").strip()
+    if name:
+        require_name(name)
+        return root / name, name, "AGENTBUS_MAILBOX"
+
+    top = git_toplevel()
+    if top is not None:
+        name = f"claude-{normalize_mailbox(top.name) or 'repo'}"
+        require_name(name)
+        return root / name, name, "git"
+
+    return root / DEFAULT_MAILBOX, DEFAULT_MAILBOX, "default"
+
+
+def share() -> Path:
+    """An existing mailbox; every command except send/reply/init needs one."""
+    root, _, _ = resolve_share()
     if not root.is_dir():
         sys.exit(f"cb: share directory does not exist: {root}\n"
-                 f"cb: set AGENTBUS_SHARE or create it")
+                 f"cb: set AGENTBUS_SHARE, AGENTBUS_MAILBOX or run cb init")
+    return root
+
+
+def share_for_write() -> Path:
+    """A mailbox for send/reply/init: created on demand."""
+    root, _, _ = resolve_share()
+    root.mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -51,6 +119,69 @@ def read_message(root: Path, message_id: str) -> dict:
         if path.is_file():
             return json.loads(path.read_text(encoding="utf-8"))
     sys.exit(f"cb: unknown message: {message_id}")
+
+
+def find_message(root: Path, message_id: str) -> dict | None:
+    for folder in ("inbox", "read"):
+        path = root / folder / message_id / "message.json"
+        if path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return None
+    return None
+
+
+def load_json(path: Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def find_receipt(root: Path, message_id: str) -> dict | None:
+    """The receipt of a message we sent: sent/<stem>.receipt.json with this id."""
+    sent = root / "sent"
+    if not sent.is_dir():
+        return None
+    for path in sorted(sent.glob("*.receipt.json")):
+        receipt = load_json(path)
+        if receipt and str(receipt.get("id")) == message_id:
+            return receipt
+    return None
+
+
+def ticket_of(root: Path, message: dict, seen: set[str] | None = None) -> str | None:
+    """meta.ticket of the nearest ancestor we can reach through receipts."""
+    seen = seen if seen is not None else set()
+    message_id = str(message.get("id"))
+    if message_id in seen:
+        return None
+    seen.add(message_id)
+
+    ticket = (message.get("meta") or {}).get("ticket")
+    if ticket:
+        return str(ticket)
+
+    parent_id = message.get("parent_id")
+    if not parent_id:
+        return None
+    parent_id = str(parent_id)
+
+    receipt = find_receipt(root, parent_id)
+    if receipt:
+        file = receipt.get("file")
+        if file:
+            sent_file = load_json(root / "sent" / str(file))
+            if sent_file:
+                ticket = (sent_file.get("meta") or {}).get("ticket")
+                if ticket:
+                    return str(ticket)
+    parent = find_message(root, parent_id)
+    if parent:
+        return ticket_of(root, parent, seen)
+    return None
 
 
 def drop(root: Path, payload: dict) -> Path:
@@ -64,6 +195,26 @@ def drop(root: Path, payload: dict) -> Path:
     target = outbox / name
     os.replace(staging, target)
     return target
+
+
+def wait_receipt(root: Path, stem: str, seconds: float) -> tuple[dict | None, str | None]:
+    """Poll sent/<stem>.receipt.json. Returns (receipt, error text)."""
+    if seconds <= 0:
+        return None, None
+    deadline = time.monotonic() + seconds
+    while True:
+        receipt = load_json(root / "sent" / f"{stem}.receipt.json")
+        if receipt is not None:
+            return receipt, None
+        failed = root / "failed" / f"{stem}.json"
+        if failed.exists():
+            error = failed.with_suffix(".error")
+            text = error.read_text(encoding="utf-8").strip() if error.is_file() else ""
+            return None, text or f"{failed.name} rejected by the bridge"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, None
+        time.sleep(min(0.5, remaining))
 
 
 def read_body(args: argparse.Namespace) -> str:
@@ -80,8 +231,22 @@ def read_body(args: argparse.Namespace) -> str:
     sys.exit("cb: empty body")
 
 
+def print_with_receipt(root: Path, path: Path, shown: dict, wait_seconds: float) -> int:
+    receipt, error = wait_receipt(root, path.stem, wait_seconds)
+    if error is not None:
+        print(f"cb: {error}", file=sys.stderr)
+        return 1
+    if receipt is not None:
+        shown["id"] = receipt.get("id")
+        shown["thread_id"] = receipt.get("thread_id")
+    elif wait_seconds > 0:
+        print(f"cb: no receipt after {wait_seconds:g}s, message id is unknown", file=sys.stderr)
+    print(json.dumps(shown, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_send(args: argparse.Namespace) -> int:
-    root = share()
+    root = share_for_write()
     payload: dict = {
         "recipient": args.to,
         "kind": args.kind,
@@ -94,28 +259,53 @@ def cmd_send(args: argparse.Namespace) -> int:
         if value:
             payload[key] = value
     path = drop(root, payload)
-    shown = {k: v for k, v in payload.items() if k != "body"}
-    print(json.dumps({"queued_file": str(path), **shown}, ensure_ascii=False, indent=2))
-    print("host заберёт файл в течение пары секунд", file=sys.stderr)
-    return 0
+    shown = {"queued_file": str(path)}
+    shown.update({k: v for k, v in payload.items() if k != "body"})
+    code = print_with_receipt(root, path, shown, args.wait_id)
+    if code == 0:
+        print("host заберёт файл в течение пары секунд", file=sys.stderr)
+    return code
 
 
 def cmd_reply(args: argparse.Namespace) -> int:
-    root = share()
+    root = share_for_write()
     original = read_message(root, args.message_id)
+    meta = json.loads(args.meta)
+    if args.kind == "verdict":
+        meta.setdefault("decision", "rework")
+        if not meta.get("ticket"):
+            ticket = ticket_of(root, original)
+            if ticket:
+                meta["ticket"] = ticket
     payload = {
         "recipient": original["sender"],
         "kind": args.kind,
         "body": read_body(args),
         "thread_id": original.get("thread_id"),
         "parent_id": args.message_id,
-        "meta": json.loads(args.meta),
+        "meta": meta,
     }
     path = drop(root, payload)
-    print(json.dumps({"queued_file": str(path), "reply_to": args.message_id,
-                      "recipient": payload["recipient"], "kind": payload["kind"]},
-                     ensure_ascii=False, indent=2))
-    return 0
+    shown = {"queued_file": str(path), "reply_to": args.message_id,
+             "recipient": payload["recipient"], "kind": payload["kind"],
+             "meta": meta}
+    return print_with_receipt(root, path, shown, args.wait_id)
+
+
+def inbox_messages(root: Path) -> list[dict]:
+    """Every delivered message, unread first, deduplicated by id."""
+    messages: dict[str, dict] = {}
+    for folder_name in ("inbox", "read"):
+        folder = root / folder_name
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.iterdir()):
+            if not path.is_dir() or path.name.startswith("."):
+                continue
+            message = load_json(path / "message.json")
+            if message:
+                messages.setdefault(str(message.get("id")), message)
+    return list(messages.values())
 
 
 def cmd_inbox(args: argparse.Namespace) -> int:
@@ -132,9 +322,11 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         if args.folder:
             print(folder.name)
         else:
+            ticket = ticket_of(root, message)
+            suffix = f"  тикет {ticket}" if ticket else ""
             first = (message.get("body") or "").strip().splitlines()
             print(f"{message['id']}  [{message['kind']}] от {message['sender']}  "
-                  f"тред {message.get('thread_id')}")
+                  f"тред {message.get('thread_id')}{suffix}")
             if first:
                 print(f"    {first[0][:160]}")
             if message.get("artifacts"):
@@ -149,8 +341,10 @@ def cmd_show(args: argparse.Namespace) -> int:
     root = share()
     message = read_message(root, args.message_id)
     if args.text:
+        ticket = ticket_of(root, message)
+        suffix = f"  тикет {ticket}" if ticket else ""
         print(f"# {message['id']} [{message['kind']}] от {message['sender']} "
-              f"тред {message.get('thread_id')}\n")
+              f"тред {message.get('thread_id')}{suffix}\n")
         print(message.get("body") or "")
         stat = (message.get("meta") or {}).get("diff_stat")
         if stat:
@@ -176,18 +370,78 @@ def cmd_file(args: argparse.Namespace) -> int:
     sys.exit(f"cb: no {args.name} for {args.message_id}")
 
 
-def cmd_read(args: argparse.Namespace) -> int:
-    root = share()
-    source = root / "inbox" / args.message_id
+def move_to_read(root: Path, message_id: str) -> None:
+    source = root / "inbox" / message_id
     if not source.is_dir():
-        sys.exit(f"cb: inbox/{args.message_id} not found")
-    target = root / "read" / args.message_id
+        sys.exit(f"cb: inbox/{message_id} not found")
+    target = root / "read" / message_id
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         shutil.rmtree(target)
     shutil.move(str(source), str(target))
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    root = share()
+    move_to_read(root, args.message_id)
     print(f"moved to read/{args.message_id}")
     return 0
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    root = share()
+    folder = root / "inbox" / args.message_id
+    if not folder.is_dir():
+        sys.exit(f"cb: inbox/{args.message_id} not found")
+    decision = {"decision": "accept", "note": args.note or ""}
+    (folder / "decision.json").write_text(
+        json.dumps(decision, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    move_to_read(root, args.message_id)
+    print(f"accepted {args.message_id} -> read/{args.message_id}")
+    return 0
+
+
+def checks_label(message: dict) -> str:
+    checks = (message.get("meta") or {}).get("checks")
+    if isinstance(checks, dict) and "ok" in checks:
+        return "ok" if checks.get("ok") else "fail"
+    return "-"
+
+
+def wait_line(root: Path, message: dict) -> str:
+    ticket = ticket_of(root, message) or "-"
+    timeout = str(bool((message.get("meta") or {}).get("timeout"))).lower()
+    return (f"{message.get('parent_id')} -> {message.get('id')}  "
+            f"[{message.get('kind')}]  {ticket}  "
+            f"checks={checks_label(message)}  timeout={timeout}")
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    root = share()
+    ids = list(dict.fromkeys(args.ids))
+    deadline = time.monotonic() + args.timeout
+    answered: dict[str, set[str]] = {message_id: set() for message_id in ids}
+    printed: set[str] = set()
+
+    while True:
+        for message in inbox_messages(root):
+            message_id = str(message.get("id"))
+            parent_id = str(message.get("parent_id") or "")
+            if parent_id not in answered or message_id in printed:
+                continue
+            printed.add(message_id)
+            answered[parent_id].add(message_id)
+            print(wait_line(root, message))
+
+        if printed and not args.all:
+            return 0
+        if args.all and all(answered.values()):
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 2
+        time.sleep(min(2.0, remaining))
 
 
 def cmd_sent(args: argparse.Namespace) -> int:
@@ -209,14 +463,28 @@ def cmd_sent(args: argparse.Namespace) -> int:
 
 def cmd_env(args: argparse.Namespace) -> int:
     root = share()
+    _, mailbox, source = resolve_share()
     print(json.dumps({
         "share": str(root),
+        "mailbox": mailbox,
+        "source": source,
         "outbox": str(root / "outbox"),
         "inbox": str(root / "inbox"),
         "unread": sum(1 for p in (root / "inbox").iterdir()
                       if p.is_dir() and not (root / "read" / p.name).exists())
         if (root / "inbox").is_dir() else 0,
     }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    if args.name:
+        root = share_root() / require_name(args.name)
+    else:
+        root, _, _ = resolve_share()
+    for name in ("outbox", "inbox", "sent", "read"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    print(root)
     return 0
 
 
@@ -232,6 +500,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cb", description="agentbus client over a shared directory")
     sub = parser.add_subparsers(dest="command", required=True, parser_class=_SubParser)
 
+    init = sub.add_parser("init", help="создать ящик")
+    init.add_argument("name", nargs="?")
+    init.set_defaults(func=cmd_init)
+
     send = sub.add_parser("send", help="положить сообщение в outbox")
     send.add_argument("--to", required=True)
     send.add_argument("--kind", default="task")
@@ -240,6 +512,8 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--base")
     send.add_argument("--parent")
     send.add_argument("--meta", default="{}")
+    send.add_argument("--wait-id", type=float, default=15.0,
+                      help="сколько секунд ждать квитанцию с id (0 — не ждать)")
     send.add_argument("--body-file")
     send.add_argument("--body")
     send.add_argument("text", nargs="*")
@@ -249,6 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
     reply.add_argument("message_id")
     reply.add_argument("--kind", default="verdict")
     reply.add_argument("--meta", default="{}")
+    reply.add_argument("--wait-id", type=float, default=15.0,
+                       help="сколько секунд ждать квитанцию с id (0 — не ждать)")
     reply.add_argument("--body-file")
     reply.add_argument("--body")
     reply.add_argument("text", nargs="*")
@@ -276,6 +552,18 @@ def build_parser() -> argparse.ArgumentParser:
     read = sub.add_parser("read", help="перенести в read/")
     read.add_argument("message_id")
     read.set_defaults(func=cmd_read)
+
+    accept = sub.add_parser("accept", help="принять результат и перенести в read/")
+    accept.add_argument("message_id")
+    accept.add_argument("--note")
+    accept.set_defaults(func=cmd_accept)
+
+    wait = sub.add_parser("wait", help="ждать ответы по parent_id")
+    wait.add_argument("ids", nargs="+")
+    wait.add_argument("--all", action="store_true", help="ждать ответы на все id")
+    wait.add_argument("--any", action="store_true", help="вернуться после первого (по умолчанию)")
+    wait.add_argument("--timeout", type=float, default=3600.0)
+    wait.set_defaults(func=cmd_wait)
 
     sent = sub.add_parser("sent", help="что ушло в очередь")
     sent.set_defaults(func=cmd_sent)

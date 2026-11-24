@@ -201,9 +201,53 @@ def test_read_closes_the_message(client: TestClient, tmp_path: Path) -> None:
     _, _, acked = bridge.run_once()
     assert acked == 1
     assert client.get(f"/v1/messages/{message['id']}").json()["state"] == "done"
+    assert (
+        client.get(f"/v1/messages/{message['id']}").json()["meta"]["state_note"] == "read in the VM"
+    )
 
     _, _, again = bridge.run_once()
     assert again == 0
+
+
+def test_accept_decision_becomes_the_state_note(client: TestClient, tmp_path: Path) -> None:
+    message = send(client, recipient="cage-claude", sender="local-opencode", kind="result")
+    share = tmp_path / "share"
+    bridge = make_bridge(client, share, tmp_path / "state")
+    bridge.run_once()
+
+    target = share / "cage-claude" / "read" / message["id"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    (share / "cage-claude" / "inbox" / message["id"]).rename(target)
+    (target / "decision.json").write_text(
+        json.dumps({"decision": "accept", "note": "всё ок"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    _, _, acked = bridge.run_once()
+
+    assert acked == 1
+    assert (
+        client.get(f"/v1/messages/{message['id']}").json()["meta"]["state_note"] == "accept: всё ок"
+    )
+
+
+def test_accept_without_note_sets_the_short_state_note(client: TestClient, tmp_path: Path) -> None:
+    message = send(client, recipient="cage-claude", sender="local-opencode", kind="result")
+    share = tmp_path / "share"
+    bridge = make_bridge(client, share, tmp_path / "state")
+    bridge.run_once()
+
+    target = share / "cage-claude" / "read" / message["id"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    (share / "cage-claude" / "inbox" / message["id"]).rename(target)
+    (target / "decision.json").write_text(
+        json.dumps({"decision": "accept", "note": ""}), encoding="utf-8"
+    )
+
+    _, _, acked = bridge.run_once()
+
+    assert acked == 1
+    assert client.get(f"/v1/messages/{message['id']}").json()["meta"]["state_note"] == "accept"
 
 
 def test_share_layout_is_created(client: TestClient, tmp_path: Path) -> None:
