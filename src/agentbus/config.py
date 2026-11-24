@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 DEFAULT_DATABASE_URL = "postgresql://agentbus:agentbus@127.0.0.1:5455/agentbus"
 
@@ -47,8 +48,7 @@ class Settings:
 
 @dataclass(frozen=True)
 class BridgeSettings:
-    share_dir: str
-    agent: str
+    share_root: str
     url: str
     token: str
     state_dir: str
@@ -56,12 +56,19 @@ class BridgeSettings:
 
     @classmethod
     def from_env(cls) -> BridgeSettings:
-        share = os.environ.get("AGENTBUS_SHARE", "").strip()
-        if not share:
-            raise RuntimeError("AGENTBUS_SHARE is required (path of the shared directory)")
+        # AGENTBUS_SHARE_ROOT wins; otherwise the root is the parent of the old
+        # single-mailbox AGENTBUS_SHARE, so existing env files keep working.
+        root = os.environ.get("AGENTBUS_SHARE_ROOT", "").strip()
+        if not root:
+            share = os.environ.get("AGENTBUS_SHARE", "").strip()
+            if share:
+                root = str(Path(share).expanduser().parent)
+        if not root:
+            raise RuntimeError(
+                "AGENTBUS_SHARE_ROOT or AGENTBUS_SHARE is required (path of the mailboxes root)"
+            )
         return cls(
-            share_dir=os.path.expanduser(share),
-            agent=os.environ.get("AGENTBUS_BRIDGE_AGENT", "cage-claude"),
+            share_root=os.path.expanduser(root),
             url=os.environ.get("AGENTBUS_URL", "http://127.0.0.1:8787").rstrip("/"),
             token=_required("AGENTBUS_TOKEN"),
             state_dir=os.path.expanduser(

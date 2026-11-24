@@ -3,12 +3,12 @@
 The VM only ever reads and writes files inside a shared directory. This process, which
 runs on the host next to the API, is the only side that speaks HTTP.
 
-AGENTBUS_SHARE is the agent's own folder inside the share and has the same value in the
-host and inside the VM, so there is no second guess about paths. Layout:
+Every subfolder of the share root is one mailbox: the folder name is the agent name, so
+one bridge process serves all of them. New folders are picked up on the next tick. Layout:
 
-    <share>/cage-claude/
+    <share_root>/<agent>/
         outbox/              # VM drops <anything>.json here -> becomes a message
-        sent/                # bridge moved accepted files here
+        sent/                # bridge moved accepted files here (+ <stem>.receipt.json)
         failed/              # bridge moved rejected files here (+ .error)
         inbox/<message_id>/  # bridge delivers a message here
             message.json
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -33,6 +34,7 @@ import httpx
 from agentbus.config import BridgeSettings
 
 MAX_INBOX_BYTES = 5 * 1024 * 1024
+MAILBOX_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 
 
 def log(message: str) -> None:
@@ -56,11 +58,11 @@ class Api:
 
 
 class Bridge:
-    def __init__(self, settings: BridgeSettings, api: Any) -> None:
+    def __init__(self, settings: BridgeSettings, api: Any, mailbox_dir: Path, agent: str) -> None:
         self.settings = settings
         self.api = api
-        self.agent = settings.agent
-        self.root = Path(settings.share_dir).expanduser()
+        self.agent = agent
+        self.root = Path(mailbox_dir).expanduser()
         self.outbox = self.root / "outbox"
         self.sent = self.root / "sent"
         self.failed = self.root / "failed"
@@ -85,7 +87,7 @@ class Bridge:
                 self._reject(path, "expected a json object")
                 continue
 
-            payload.setdefault("sender", self.agent)
+            payload["sender"] = self.agent
             key = f"{self.agent}:{path.stem}"
             payload["idempotency_key"] = key
             try:
@@ -99,6 +101,7 @@ class Bridge:
                 log(
                     f"{path.name} -> {body.get('id')} {body.get('kind')} -> {body.get('recipient')}"
                 )
+                self._receipt(path, body)
                 self._move(path, self.sent)
                 sent += 1
             elif response.status_code >= 500:
@@ -111,6 +114,21 @@ class Bridge:
         log(f"{path.name} rejected: {reason}")
         target = self._move(path, self.failed)
         (target.with_suffix(".error")).write_text(reason + "\n", encoding="utf-8")
+
+    def _receipt(self, path: Path, body: dict[str, Any]) -> None:
+        """Record the accepted message next to its file, atomically, before moving it."""
+        receipt = {
+            "file": path.name,
+            "id": body.get("id"),
+            "thread_id": body.get("thread_id"),
+            "kind": body.get("kind"),
+            "recipient": body.get("recipient"),
+            "created_at": str(body.get("created_at")),
+        }
+        tmp = self.sent / f".{path.stem}.receipt.tmp"
+        target = self.sent / f"{path.stem}.receipt.json"
+        tmp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
 
     def _move(self, path: Path, directory: Path) -> Path:
         target = _unique(directory / path.name)
@@ -222,6 +240,51 @@ class Bridge:
         return self.pump_outbox(), self.pump_inbox(), self.pump_read()
 
 
+class MultiBridge:
+    """Serves every valid mailbox folder inside the share root as its own agent."""
+
+    def __init__(self, settings: BridgeSettings, api: Any) -> None:
+        self.settings = settings
+        self.api = api
+        self.root = Path(settings.share_root).expanduser()
+        self.mailboxes: dict[str, Bridge] = {}
+        self._invalid: set[str] = set()
+
+    def discover(self) -> list[str]:
+        """Valid mailbox folders, sorted. Invalid names are logged once, not every tick."""
+        if not self.root.is_dir():
+            return []
+        names: list[str] = []
+        for path in self.root.iterdir():
+            if not path.is_dir():
+                continue
+            name = path.name
+            if name.startswith("."):
+                continue
+            if MAILBOX_NAME.fullmatch(name):
+                names.append(name)
+            elif name not in self._invalid:
+                self._invalid.add(name)
+                log(f"mailbox {name!r}: invalid name, skipped")
+        return sorted(names)
+
+    def run_once(self) -> tuple[int, int, int]:
+        totals = [0, 0, 0]
+        for name in self.discover():
+            try:
+                bridge = self.mailboxes.get(name)
+                if bridge is None:
+                    bridge = Bridge(self.settings, self.api, self.root / name, name)
+                    self.mailboxes[name] = bridge
+                counts = bridge.run_once()
+            except Exception as exc:  # noqa: BLE001 - one broken mailbox must not stop others
+                log(f"mailbox {name}: {exc!r}")
+                continue
+            for index, count in enumerate(counts):
+                totals[index] += count
+        return totals[0], totals[1], totals[2]
+
+
 def _unique(path: Path) -> Path:
     if not path.exists():
         return path
@@ -237,8 +300,12 @@ def _unique(path: Path) -> Path:
 def main() -> int:
     settings = BridgeSettings.from_env()
     api = Api(settings.url, settings.token)
-    bridge = Bridge(settings, api)
-    log(f"share={bridge.root} interval={settings.interval}s")
+    bridge = MultiBridge(settings, api)
+    mailboxes = bridge.discover()
+    log(f"share_root={bridge.root} mailboxes={mailboxes} interval={settings.interval}s")
+    legacy = os.environ.get("AGENTBUS_BRIDGE_AGENT", "").strip()
+    if legacy and legacy not in mailboxes:
+        log(f"AGENTBUS_BRIDGE_AGENT={legacy} is obsolete and ignored: mailbox = folder name")
     try:
         while True:
             bridge.run_once()
