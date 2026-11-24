@@ -105,6 +105,7 @@ class WorkerSettings:
     extra_instructions: str
     slots: int
     stop_grace_seconds: int
+    commit_author: str
 
     @classmethod
     def from_env(cls) -> WorkerSettings:
@@ -129,4 +130,7 @@ class WorkerSettings:
             extra_instructions=os.environ.get("AGENTBUS_POLICY", ""),
             slots=max(1, _int("AGENTBUS_WORKER_SLOTS", 1)),
             stop_grace_seconds=_int("AGENTBUS_STOP_GRACE", task_timeout),
+            commit_author=os.environ.get(
+                "AGENTBUS_COMMIT_AUTHOR", "agentbus executor <agentbus@localhost>"
+            ),
         )

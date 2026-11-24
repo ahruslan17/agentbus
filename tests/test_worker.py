@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
@@ -102,6 +103,7 @@ def worker_settings(
         extra_instructions="",
         slots=slots,
         stop_grace_seconds=grace,
+        commit_author="agentbus executor <agentbus@localhost>",
     )
 
 
@@ -355,3 +357,345 @@ def test_registry_failure_does_not_block_the_task(
     finally:
         stop.set()
         join_all(threads)
+
+
+SCRIPTED_OPENCODE = """#!__PYTHON__
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+journal = os.environ.get("FAKE_JOURNAL")
+if journal:
+    with open(journal, "a", encoding="utf-8") as sink:
+        sink.write(f"start {time.time()} {Path.cwd()}\\n")
+        sink.flush()
+
+for line in os.environ.get("FAKE_FIRST_LINES", "").splitlines():
+    print(line, flush=True)
+
+time.sleep(float(os.environ.get("FAKE_SLEEP", "0.1")))
+
+cwd = Path.cwd()
+for name, content in json.loads(os.environ.get("FAKE_FILES", "{}")).items():
+    path = cwd / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+message = os.environ.get("FAKE_GIT_COMMIT")
+if message:
+    subprocess.run(
+        ["git", "-c", "user.name=executor", "-c", "user.email=executor@test", "add", "-A"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=executor",
+            "-c",
+            "user.email=executor@test",
+            "commit",
+            "-qm",
+            message,
+        ],
+        check=True,
+    )
+
+for line in os.environ.get("FAKE_EVENTS", "").splitlines():
+    print(line, flush=True)
+
+if journal:
+    with open(journal, "a", encoding="utf-8") as sink:
+        sink.write(f"end {time.time()}\\n")
+        sink.flush()
+"""
+
+
+@pytest.fixture()
+def scripted_opencode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    script = tmp_path / "fake-opencode"
+    script.write_text(SCRIPTED_OPENCODE.replace("__PYTHON__", sys.executable), encoding="utf-8")
+    script.chmod(0o755)
+
+    def configure(**env: str) -> None:
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+
+    configure(FAKE_SLEEP="0.05")
+    return configure
+
+
+def git(path: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(path), *args], capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+def result_of(client: TestClient, message: dict) -> dict:
+    messages = client.get(f"/v1/threads/{message['thread_id']}").json()["messages"]
+    return next(
+        row for row in messages if row["kind"] == "result" and row["parent_id"] == message["id"]
+    )
+
+
+def artifacts_of(settings: WorkerSettings, result: dict) -> Path:
+    return Path(settings.state_dir) / "artifacts" / result["id"]
+
+
+def run_one(settings: WorkerSettings, client: TestClient, **overrides) -> tuple[dict, dict, Path]:
+    stop = threading.Event()
+    message = send(client, **overrides)
+    threads = run_slots(settings, stop, http=client)
+    try:
+        wait_for_result(client, message)
+    finally:
+        stop.set()
+        join_all(threads)
+    result = result_of(client, message)
+    return message, result, artifacts_of(settings, result)
+
+
+def test_task_makes_one_commit_and_accumulated_patch(
+    tmp_path: Path, repo: Path, client: TestClient, scripted_opencode
+) -> None:
+    scripted_opencode(FAKE_FILES=json.dumps({"note.txt": "one\n"}))
+    settings = worker_settings(tmp_path, repo)
+    base = git(repo, "rev-parse", "HEAD")
+
+    message, result, artifacts = run_one(settings, client, repo=str(repo), meta={"ticket": "T4b.1"})
+    worktree = tmp_path / "state" / "worktrees" / message["thread_id"]
+
+    assert git(worktree, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert (
+        git(worktree, "log", "-1", "--format=%an <%ae>") == "agentbus executor <agentbus@localhost>"
+    )
+    assert git(worktree, "log", "-1", "--format=%s") == "agentbus: T4b.1 attempt 1"
+
+    meta = result["meta"]
+    patch = (artifacts / "patch.diff").read_text(encoding="utf-8")
+    assert "note.txt" in patch
+    assert meta["files_changed"] == ["note.txt"]
+    assert meta["patch_bytes"] > 0
+    assert meta["head_commit"] == git(worktree, "rev-parse", "HEAD")
+
+
+def test_fix_in_same_thread_keeps_full_patch_and_separate_attempt_patch(
+    tmp_path: Path, repo: Path, client: TestClient, scripted_opencode
+) -> None:
+    scripted_opencode(FAKE_FILES=json.dumps({"note.txt": "one\n"}))
+    settings = worker_settings(tmp_path, repo)
+    base = git(repo, "rev-parse", "HEAD")
+    stop = threading.Event()
+    threads = run_slots(settings, stop, http=client)
+    try:
+        first = send(client, repo=str(repo), body="первая")
+        wait_for_result(client, first)
+        scripted_opencode(FAKE_FILES=json.dumps({"other.txt": "two\n"}))
+        second = send(
+            client,
+            kind="fix",
+            repo=str(repo),
+            thread_id=first["thread_id"],
+            body="доработка",
+        )
+        wait_for_result(client, second)
+    finally:
+        stop.set()
+        join_all(threads)
+
+    worktree = tmp_path / "state" / "worktrees" / first["thread_id"]
+    assert git(worktree, "rev-list", "--count", f"{base}..HEAD") == "2"
+
+    first_result = result_of(client, first)
+    second_result = result_of(client, second)
+    first_artifacts = artifacts_of(settings, first_result)
+    second_artifacts = artifacts_of(settings, second_result)
+
+    full = (second_artifacts / "patch.diff").read_text(encoding="utf-8")
+    attempt = (second_artifacts / "attempt.diff").read_text(encoding="utf-8")
+    assert "note.txt" in full and "other.txt" in full
+    assert "other.txt" in attempt and "note.txt" not in attempt
+    assert second_result["meta"]["files_changed"] == ["note.txt", "other.txt"]
+    assert second_result["meta"]["attempt_files_changed"] == ["other.txt"]
+
+    first_patch = (first_artifacts / "patch.diff").read_text(encoding="utf-8")
+    assert "note.txt" in first_patch and "other.txt" not in first_patch
+    assert first_result["meta"]["attempt_files_changed"] == ["note.txt"]
+
+
+def test_executor_commits_are_kept_and_included_in_patch(
+    tmp_path: Path, repo: Path, client: TestClient, scripted_opencode
+) -> None:
+    scripted_opencode(
+        FAKE_FILES=json.dumps({"exec.txt": "executor\n"}),
+        FAKE_GIT_COMMIT="executor: own commit",
+    )
+    settings = worker_settings(tmp_path, repo)
+    base = git(repo, "rev-parse", "HEAD")
+
+    message, result, artifacts = run_one(settings, client, repo=str(repo))
+    worktree = tmp_path / "state" / "worktrees" / message["thread_id"]
+
+    assert git(worktree, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert git(worktree, "log", "-1", "--format=%an <%ae>") == "executor <executor@test>"
+    assert git(worktree, "log", "-1", "--format=%s") == "executor: own commit"
+
+    patch = (artifacts / "patch.diff").read_text(encoding="utf-8")
+    assert "exec.txt" in patch
+    assert result["meta"]["files_changed"] == ["exec.txt"]
+    assert result["meta"]["patch_bytes"] > 0
+
+
+def test_empty_attempt_makes_no_commit_and_zero_patch(
+    tmp_path: Path, repo: Path, client: TestClient, scripted_opencode
+) -> None:
+    scripted_opencode()
+    settings = worker_settings(tmp_path, repo)
+    base = git(repo, "rev-parse", "HEAD")
+
+    message, result, artifacts = run_one(settings, client, repo=str(repo))
+    worktree = tmp_path / "state" / "worktrees" / message["thread_id"]
+
+    assert git(worktree, "rev-list", "--count", f"{base}..HEAD") == "0"
+    assert (artifacts / "patch.diff").read_text(encoding="utf-8") == ""
+    assert (artifacts / "attempt.diff").read_text(encoding="utf-8") == ""
+    assert result["meta"]["patch_bytes"] == 0
+    assert result["meta"]["files_changed"] == []
+    assert result["meta"]["attempt_files_changed"] == []
+
+
+def test_usage_sums_all_steps_and_counts_tool_calls(
+    tmp_path: Path, repo: Path, client: TestClient, scripted_opencode
+) -> None:
+    events = [
+        {"type": "tool_use", "part": {"tool": "bash"}},
+        {
+            "type": "step_finish",
+            "part": {
+                "cost": 0.1,
+                "tokens": {
+                    "input": 1,
+                    "output": 2,
+                    "reasoning": 3,
+                    "cache": {"read": 4, "write": 5},
+                },
+            },
+        },
+        {"type": "tool_use", "part": {"tool": "read"}},
+        {
+            "type": "step_finish",
+            "part": {
+                "cost": 0.2,
+                "tokens": {
+                    "input": 10,
+                    "output": 20,
+                    "reasoning": 30,
+                    "cache": {"read": 40, "write": 50},
+                },
+            },
+        },
+        {
+            "type": "step_finish",
+            "part": {
+                "cost": 0.3,
+                "tokens": {
+                    "input": 100,
+                    "output": 200,
+                    "reasoning": 300,
+                    "cache": {"read": 400, "write": 500},
+                },
+            },
+        },
+    ]
+    scripted_opencode(FAKE_EVENTS="\n".join(json.dumps(event) for event in events))
+    settings = worker_settings(tmp_path, repo)
+
+    _, result, _ = run_one(settings, client, repo=str(repo))
+    usage = result["meta"]["usage"]
+
+    assert usage["steps"] == 3
+    assert usage["tool_calls"] == 2
+    assert usage["tokens"]["input"] == 111
+    assert usage["tokens"]["output"] == 222
+    assert usage["tokens"]["reasoning"] == 333
+    assert usage["tokens"]["cache"] == {"read": 444, "write": 555}
+    assert usage["cost"] == pytest.approx(0.6)
+    assert result["meta"]["model"] == "fake/model"
+    assert result["meta"]["harness"] == "opencode"
+
+
+def test_run_log_shows_lines_while_opencode_is_running(
+    tmp_path: Path, repo: Path, client: TestClient, scripted_opencode
+) -> None:
+    line = json.dumps({"type": "text", "part": {"time": {"end": 1.0}, "text": "первая"}})
+    scripted_opencode(
+        FAKE_FIRST_LINES=line,
+        FAKE_SLEEP="2",
+        FAKE_JOURNAL=str(tmp_path / "journal.txt"),
+    )
+    settings = worker_settings(tmp_path, repo)
+    stop = threading.Event()
+    message = send(client, repo=str(repo), body="долго")
+    threads = run_slots(settings, stop, http=client)
+    try:
+        log_path = tmp_path / "state" / "artifacts" / message["id"] / "run.log"
+        deadline = time.monotonic() + 10
+        seen = False
+        while time.monotonic() < deadline:
+            if log_path.exists() and line in log_path.read_text(encoding="utf-8"):
+                seen = True
+                break
+            time.sleep(0.02)
+        assert seen, "run.log did not expose the first line while opencode was running"
+        _, ends = journal_times(tmp_path)
+        assert not ends, "the line was only visible after opencode finished"
+        wait_for_result(client, message)
+    finally:
+        stop.set()
+        join_all(threads)
+
+
+def test_thread_without_base_file_falls_back_to_merge_base(
+    tmp_path: Path, repo: Path, client: TestClient, scripted_opencode
+) -> None:
+    scripted_opencode()
+    settings = worker_settings(tmp_path, repo)
+    base = git(repo, "rev-parse", "HEAD")
+    message = send(client, repo=str(repo), body="старый тред")
+
+    worktree = tmp_path / "state" / "worktrees" / message["thread_id"]
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    git(repo, "worktree", "add", "-b", f"agentbus/{message['thread_id']}", str(worktree))
+    (worktree / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+    git(worktree, "-c", "user.name=e", "-c", "user.email=e@t", "add", "-A")
+    git(
+        worktree,
+        "-c",
+        "user.name=e",
+        "-c",
+        "user.email=e@t",
+        "commit",
+        "-qm",
+        "legacy change",
+    )
+    base_file = tmp_path / "state" / "threads" / f"{message['thread_id']}.json"
+    assert not base_file.exists()
+
+    stop = threading.Event()
+    threads = run_slots(settings, stop, http=client)
+    try:
+        wait_for_result(client, message)
+    finally:
+        stop.set()
+        join_all(threads)
+
+    result = result_of(client, message)
+    artifacts = artifacts_of(settings, result)
+    patch = (artifacts / "patch.diff").read_text(encoding="utf-8")
+    assert result["meta"]["base_commit"] == base
+    assert "legacy.txt" in patch
+    assert result["meta"]["files_changed"] == ["legacy.txt"]
+    assert result["meta"]["patch_bytes"] > 0

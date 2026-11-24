@@ -208,32 +208,81 @@ def repo_lock(settings: WorkerSettings, repo: Path, name: str) -> Iterator[None]
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _base_file(settings: WorkerSettings, key: str) -> Path:
+    return Path(settings.state_dir).expanduser() / "threads" / f"{key}.json"
+
+
+def _read_base(settings: WorkerSettings, key: str) -> str | None:
+    try:
+        data = json.loads(_base_file(settings, key).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    commit = str(data.get("base_commit") or "").strip()
+    return commit or None
+
+
+def _write_base(settings: WorkerSettings, key: str, base_commit: str, branch: str) -> None:
+    path = _base_file(settings, key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"base_commit": base_commit, "branch": branch}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _merge_base(worktree: Path, base_ref: str | None) -> str:
+    """Base commit for a thread that predates `<state_dir>/threads/<id>.json`."""
+    refs = [str(base_ref)] if base_ref else []
+    refs += ["master", "main"]
+    for ref in refs:
+        try:
+            value = _git(worktree, "merge-base", "HEAD", ref).strip()
+        except RuntimeError:
+            continue
+        if value:
+            return value
+    roots = _git(worktree, "rev-list", "--max-parents=0", "HEAD").split()
+    return roots[-1] if roots else _git(worktree, "rev-parse", "HEAD").strip()
+
+
+def _existing_worktree(
+    settings: WorkerSettings, key: str, path: Path, branch: str, base_ref: str | None
+) -> tuple[Path, str, str]:
+    actual = _branch_of(path) or branch
+    base = _read_base(settings, key)
+    if base is None:
+        base = _merge_base(path, base_ref)
+        _write_base(settings, key, base, actual)
+    return path, actual, base
+
+
 def prepare_worktree(
     settings: WorkerSettings, message: dict[str, Any], repo: Path
-) -> tuple[Path, str]:
+) -> tuple[Path, str, str]:
     """One worktree per thread: fixes land on the same branch the task created."""
     meta = message.get("meta") or {}
     key = str(message.get("thread_id") or message["id"])
     branch = f"agentbus/{key}"
+    base_ref = meta.get("base_ref")
 
     if meta.get("worktree"):
         path = Path(str(meta["worktree"])).expanduser()
         if (path / ".git").exists():
-            return path, _branch_of(path) or branch
+            return _existing_worktree(settings, key, path, branch, base_ref)
 
     path = Path(settings.state_dir).expanduser() / "worktrees" / key
     if (path / ".git").exists():
-        return path, _branch_of(path) or branch
+        return _existing_worktree(settings, key, path, branch, base_ref)
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    base = meta.get("base_ref")
     if _branch_exists(repo, branch):
         _git(repo, "worktree", "add", str(path), branch)
-    elif base:
-        _git(repo, "worktree", "add", "-b", branch, str(path), str(base))
+        return _existing_worktree(settings, key, path, branch, base_ref)
+    if base_ref:
+        _git(repo, "worktree", "add", "-b", branch, str(path), str(base_ref))
     else:
         _git(repo, "worktree", "add", "-b", branch, str(path))
-    return path, branch
+    base_commit = _git(path, "rev-parse", "HEAD").strip()
+    _write_base(settings, key, base_commit, branch)
+    return path, branch, base_commit
 
 
 def build_prompt(message: dict[str, Any], worktree: Path | None, branch: str, policy: str) -> str:
@@ -258,6 +307,7 @@ def build_prompt(message: dict[str, Any], worktree: Path | None, branch: str, po
             "Правила:\n"
             "- Работай только внутри этого рабочего дерева.\n"
             "- Не делай git push, не мержи в main, не переключай ветку.\n"
+            "- Не коммить — коммит сделает worker.\n"
             "- Запускай проверки, которые требует постановка.\n"
             "- В конце — короткий отчёт: что сделано, какие файлы изменены, какие команды "
             "проверки запускал и с каким результатом, что осталось неясным.\n"
@@ -307,7 +357,7 @@ def run_opencode(
     def pump() -> None:
         for line in process.stdout:
             sink.write(line)
-        sink.flush()
+            sink.flush()
 
     reader = threading.Thread(target=pump, daemon=True)
     reader.start()
@@ -342,10 +392,24 @@ def run_opencode(
     return parsed
 
 
+def _empty_usage() -> dict[str, Any]:
+    return {
+        "cost": 0.0,
+        "steps": 0,
+        "tool_calls": 0,
+        "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {"read": 0, "write": 0},
+        },
+    }
+
+
 def _parse_events(raw_log: Path, session_id: str | None) -> dict[str, Any]:
     text: list[str] = []
     errors: list[str] = []
-    usage: dict[str, Any] = {}
+    usage = _empty_usage()
     seen_session = session_id
     with raw_log.open(encoding="utf-8", errors="replace") as source:
         for line in source:
@@ -367,9 +431,19 @@ def _parse_events(raw_log: Path, session_id: str | None) -> dict[str, Any]:
                     text.append(str(part["text"]).strip())
             elif kind == "error":
                 errors.append(json.dumps(event.get("error"))[:500])
+            elif kind == "tool_use":
+                usage["tool_calls"] += 1
             elif kind == "step_finish":
                 part = event.get("part") or {}
-                usage = {"cost": part.get("cost"), "tokens": part.get("tokens")}
+                tokens = part.get("tokens") or {}
+                cache = tokens.get("cache") or {}
+                usage["steps"] += 1
+                usage["cost"] += float(part.get("cost") or 0)
+                usage["tokens"]["input"] += int(tokens.get("input") or 0)
+                usage["tokens"]["output"] += int(tokens.get("output") or 0)
+                usage["tokens"]["reasoning"] += int(tokens.get("reasoning") or 0)
+                usage["tokens"]["cache"]["read"] += int(cache.get("read") or 0)
+                usage["tokens"]["cache"]["write"] += int(cache.get("write") or 0)
     return {
         "text": "\n\n".join(text).strip(),
         "errors": errors,
@@ -378,20 +452,65 @@ def _parse_events(raw_log: Path, session_id: str | None) -> dict[str, Any]:
     }
 
 
-def collect_diff(worktree: Path, artifacts: Path) -> dict[str, Any]:
+def _author_parts(raw: str) -> tuple[str, str]:
+    name, sep, rest = raw.partition("<")
+    email = rest.rstrip(">").strip() if sep else ""
+    if not name.strip() or not email:
+        raise RuntimeError("AGENTBUS_COMMIT_AUTHOR must look like 'Name <email>'")
+    return name.strip(), email
+
+
+def commit_attempt(settings: WorkerSettings, worktree: Path, message: dict[str, Any]) -> bool:
+    """Commit whatever the executor left uncommitted; never rewrite its own commits."""
     _git(worktree, "add", "-A")
-    patch = _git(worktree, "diff", "--cached")
-    stat = _git(worktree, "diff", "--cached", "--stat")
+    if not _git(worktree, "diff", "--cached", "--name-only").strip():
+        return False
+    meta = message.get("meta") or {}
+    label = meta.get("ticket") or message.get("thread_id") or message["id"]
+    attempt = message.get("attempt")
+    name, email = _author_parts(settings.commit_author)
+    _git(
+        worktree,
+        "-c",
+        f"user.name={name}",
+        "-c",
+        f"user.email={email}",
+        "commit",
+        "--no-verify",
+        "-m",
+        f"agentbus: {label} attempt {attempt}",
+    )
+    return True
+
+
+def collect_diff(
+    worktree: Path, artifacts: Path, base_commit: str, head_before: str
+) -> dict[str, Any]:
+    head_commit = _git(worktree, "rev-parse", "HEAD").strip()
+    patch = _git(worktree, "diff", f"{base_commit}..HEAD")
+    stat = _git(worktree, "diff", f"{base_commit}..HEAD", "--stat")
     changed = [
-        line for line in _git(worktree, "diff", "--cached", "--name-only").splitlines() if line
+        line
+        for line in _git(worktree, "diff", f"{base_commit}..HEAD", "--name-only").splitlines()
+        if line
+    ]
+    attempt = _git(worktree, "diff", f"{head_before}..{head_commit}")
+    attempt_changed = [
+        line
+        for line in _git(
+            worktree, "diff", f"{head_before}..{head_commit}", "--name-only"
+        ).splitlines()
+        if line
     ]
     (artifacts / "patch.diff").write_text(patch, encoding="utf-8")
-    head = _git(worktree, "rev-parse", "--short", "HEAD").strip()
+    (artifacts / "attempt.diff").write_text(attempt, encoding="utf-8")
     return {
+        "base_commit": base_commit,
+        "head_commit": head_commit,
         "diff_stat": stat.strip(),
         "files_changed": changed,
         "patch_bytes": len(patch.encode("utf-8")),
-        "base_commit": head,
+        "attempt_files_changed": attempt_changed,
     }
 
 
@@ -430,7 +549,8 @@ def handle(
 
     if repo is not None:
         with repo_lock(settings, repo, "worktree"):
-            worktree, branch = prepare_worktree(settings, message, repo)
+            worktree, branch, base_commit = prepare_worktree(settings, message, repo)
+        head_before = _git(worktree, "rev-parse", "HEAD").strip()
         session_id = thread.get("session_id")
     else:
         worktree = (
@@ -440,6 +560,8 @@ def handle(
         )
         worktree.mkdir(parents=True, exist_ok=True)
         branch = ""
+        base_commit = ""
+        head_before = ""
         session_id = thread.get("session_id")
 
     prompt = build_prompt(
@@ -466,12 +588,15 @@ def handle(
             "duration_seconds": outcome.get("duration_seconds"),
             "timeout": outcome.get("timeout"),
             "usage": outcome.get("usage"),
+            "model": settings.model,
+            "harness": "opencode",
             "artifacts": ["run.log"],
         }
 
         if repo is not None and not outcome.get("timeout"):
-            result_meta.update(collect_diff(worktree, artifacts))
-            result_meta["artifacts"].append("patch.diff")
+            commit_attempt(settings, worktree, message)
+            result_meta.update(collect_diff(worktree, artifacts, base_commit, head_before))
+            result_meta["artifacts"].extend(["patch.diff", "attempt.diff"])
             if meta.get("checks"):
                 if meta.get("checks_parallel"):
                     result_meta["checks"] = run_checks(worktree, artifacts)
