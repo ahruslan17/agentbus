@@ -1,18 +1,26 @@
 # agentbus
 
-Локальная очередь сообщений между двумя агентами: Claude в виртуалке (cage) и
-OpenCode на хосте. Один процесс владеет состоянием — Postgres. Оба агента только
+Локальная очередь сообщений между агентами: Claude в виртуалке (cage) и
+OpenCode на хосте. Один процесс владеет состоянием — Postgres. Агенты только
 говорят с ним по HTTP.
 
 Задача этого инструмента — цикл «план → исполнение → ревью»: Claude ставит задачу,
 OpenCode выполняет её в отдельном git-worktree и возвращает отчёт с диффом, Claude
 читает и выдаёт вердикт. Никакого общего диска и файловых блокировок.
 
+Ящиков и исполнителей может быть много. Ящик — папка в общем каталоге: своя сессия
+Claude в своём продукте, без настройки. Исполнителей — пул слотов на хосте: каждый
+слот берёт свой тред, поэтому независимые тикеты идут параллельно. Что происходит
+сейчас и что было раньше, видно в локальном дашборде; полный журнал событий
+(`events`) и реестр слотов (`workers`) лежат в Postgres.
+
 ```
-┌─ VM (cage) ──────────┐        ┌─ хост ─────────────────────────────┐
-│ Claude + ab          │  HTTP  │ API (FastAPI)  →  Postgres         │
-│  send / wait / reply │◄──────►│ worker (Python) → opencode run     │
-└──────────────────────┘ bridge └────────────────────────────────────┘
+┌─ VM (cage) ──────────────┐        ┌─ хост ─────────────────────────────────┐
+│ Claude + cb, N ящиков    │  файлы │ API (FastAPI)  →  Postgres (журнал)     │
+│  send / wait / reply     │◄──────►│ bridge         →  .agentbus/<ящик>/    │
+└──────────────────────────┘        │ worker: N слотов → opencode run        │
+                                    │ дашборд: 127.0.0.1:8787/ui/            │
+                                    └────────────────────────────────────────┘
 ```
 
 ## Установка
@@ -31,13 +39,22 @@ uv run python -m agentbus.migrate
 
 ```bash
 make api      # API на 127.0.0.1:8787
-make worker   # исполнитель OpenCode
+make worker   # пул исполнителей: AGENTBUS_WORKER_SLOTS слотов
 ```
 
-Проверка, что петля живая, без вызова модели:
+Юниты пользователя ставятся симлинками:
 
 ```bash
-make smoke
+ln -sf ~/personal/agentbus/deploy/*.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now agentbus-api agentbus-bridge agentbus-worker
+```
+
+Проверки, которые не зовут модель:
+
+```bash
+make smoke        # одна задача: lease → reply → wait
+make smoke-pool   # два ящика и два параллельных lease
 ```
 
 ## Как пользоваться
@@ -48,7 +65,7 @@ Claude (в VM) ставит задачу:
 export AGENTBUS_SELF=cage-claude
 ab send --to local-opencode \
         --repo /home/ruslan/personal/real-inflation \
-        --meta '{"acceptance":["make check зелёный"],"checks":true}' \
+        --meta '{"ticket":"T1","acceptance":["make check зелёный"],"scope_files":["src/"],"checks":true}' \
         "Реализуй T1 по docs/specs/T1.md"
 ```
 
@@ -60,12 +77,16 @@ ab thread t_... --text      # вся переписка
 ab file m_... src/agentbus/api.py
 ab artifact m_... patch.diff
 ab reply m_... --kind verdict --body "правь X и Y"
-ab lease cage-claude --wait 60
+ab lease cage-claude --wait 60 --owner 'local-opencode#0'
 ```
 
-Исполнитель — обычный цикл: `lease → opencode run → reply`. Один тред = один
-worktree = одна ветка `agentbus/<thread_id>` = одна сессия OpenCode, поэтому
-правки по ревью ложатся туда же, где была задача.
+Независимые тикеты в разных тредах можно отправлять сразу — пул слотов разберёт их
+параллельно; зависимый отправляй после merge предыдущего. Один тред = один
+worktree = одна ветка `agentbus/<thread_id>` = одна сессия OpenCode, поэтому правки
+по ревью ложатся туда же, где была задача, и две задачи одного треда не пересекутся.
+
+Исполнитель — обычный цикл: `lease → opencode run → reply`. Ветку треда worker
+коммитит сам; ревью и merge — за человеком, `git merge agentbus/<thread_id>`.
 
 ## Cage без сети: файловый мост
 
@@ -183,6 +204,24 @@ cage run /home/ruslan/personal/agentbus/bin/cb inbox
 Ещё одно следствие: токен и `AGENTBUS_URL` в cage не попадают вообще. Скомпрометировать
 мост можно только записью файлов в шар, а он и так доступен только этой VM.
 
+## Дашборд
+
+На хосте, только чтение: `http://127.0.0.1:8787/ui/login?token=<AGENTBUS_TOKEN>`.
+Вход ставит HttpOnly cookie, дальше страница ходит с ней. Проверка `Host` не даёт
+браузеру обратиться к API по чужому имени.
+
+- «Сейчас» — карточка на каждый слот: свободен или занят, ящик, тикет, репозиторий,
+  сколько идёт, последний tool call, токены; ниже — очереди по ящикам.
+- «Ящики» — сколько тикетов отправлено, в работе, ждёт ревью и принято.
+- «Тред» — таймлайн `task → result → verdict → fix`, дифф по файлам, `checks.txt`,
+  лента `run.log` (у занятого треда — в реальном времени), длительность и токены.
+- «История» — все треды с фильтрами по ящику, репозиторию, состоянию и тексту.
+- «Статистика» — по ящику, репозиторию и модели: медиана очереди и исполнения, токены,
+  доля принятых с первого ревью, число доработок, таймауты и сбои.
+
+Данные обновляются через SSE (`GET /v1/stream`) с откатом на опрос; все `/v1/*`-эндпоинты
+только читают. Bearer-токен для `ab`, `cb` и worker не меняется.
+
 ## Скилл для агента в cage
 
 `skills/agentbus/SKILL.md` — инструкция для Claude в изоляции: как ставить задачу,
@@ -207,25 +246,82 @@ head -3 ~/.claude/skills/agentbus/SKILL.md
 
 ## Что в отчёте исполнителя
 
-
-`meta` ответа: `worktree`, `branch`, `files_changed`, `diff_stat`, `base_commit`,
-`exit_code`, `duration_seconds`, `usage`, `checks`, `session_id`, `artifacts`.
+`meta` ответа: `worktree`, `branch`, `repo`, `files_changed`, `diff_stat`, `base_commit`,
+`head_commit`, `attempt_files_changed`, `exit_code`, `duration_seconds`, `timeout`,
+`usage`, `checks`, `session_id`, `model`, `harness`, `artifacts`.
 
 Артефакты лежат в `~/.local/state/agentbus/artifacts/<message_id>/`: `run.log`
-(сырой JSONL OpenCode), `patch.diff`, `checks.txt`. Читаются через `ab artifact`.
+(сырой JSONL OpenCode), `patch.diff` (накопленный дифф треда от базового коммита),
+`attempt.diff` (только последняя попытка), `checks.txt`. Читаются через `ab artifact`.
+После ответа каталог переезжает под id результата.
+
+## Эксплуатация
+
+```bash
+# юниты пользователя
+ln -sf ~/personal/agentbus/deploy/*.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now agentbus-api agentbus-bridge agentbus-worker
+
+# миграции Postgres (идемпотентны)
+uv run python -m agentbus.migrate
+
+# перезапуск worker: SIGTERM не берёт новые задачи, дожидается текущих
+systemctl --user restart --no-block agentbus-worker
+```
+
+`KillMode=mixed` в `agentbus-worker.service` шлёт SIGTERM только самому worker:
+запущенные `opencode run` успевают закончить в пределах `TimeoutStopSec`
+(`AGENTBUS_STOP_GRACE` плюс запас). Поэтому рестарт не рвёт текущие прогоны.
+
+Переменные (полный список — `.env.example`):
+
+| Переменная | Что делает |
+|---|---|
+| `AGENTBUS_WORKER_SLOTS` | число слотов пула; 1 по умолчанию, рекомендовано 3–4 |
+| `AGENTBUS_PER_SENDER_LEASES` | потолок одновременных lease одного отправителя (0 — без) |
+| `AGENTBUS_ALLOWED_HOSTS` | допустимые `Host` дашборда через запятую |
+| `AGENTBUS_COMMIT_AUTHOR` | автор коммитов worker, `Name <email>` |
+| `AGENTBUS_STOP_GRACE` | сколько ждать текущие задачи при SIGTERM (по умолчанию `AGENTBUS_TASK_TIMEOUT`) |
+| `AGENTBUS_SHARE_ROOT` | корень ящиков для bridge; иначе родитель `AGENTBUS_SHARE` |
+
+### Уборка
+
+Растут worktree, артефакты и журнал. Закрытый тред — тот, в котором нет сообщений
+`queued`/`leased`. `make prune` оставляет последние `KEEP` закрытых тредов (по
+последнему `updated_at`, по умолчанию 50), остальным удаляет
+`~/.local/state/agentbus/worktrees/<thread>` через `git worktree remove --force`,
+`artifacts/<message_id>` и `threads/<thread>.json`. Строки в БД не трогаются.
+
+```bash
+make prune PRUNE_ARGS=--dry-run   # только план
+make prune KEEP=20                # удалить лишнее
+make prune PRUNE_ARGS=--delete-merged-branches  # плюс ветки, влитые в master/main
+```
+
+Ветка удаляется только через `git branch -d`, то есть лишь если она целиком влита в
+`master`/`main`; репозиторий вне `AGENTBUS_REPOS` пропускается с предупреждением.
+Из VM `git worktree prune` не запускать: worktree созданы на хосте и в VM выглядят
+`prunable`.
 
 ## Модель данных
 
 `threads` — репозиторий, базовая ветка, id сессии OpenCode.
 `messages` — сообщение: отправитель, получатель, тип, тело, `meta`, состояние,
-`parent_id`, `attempt`, `lease_until`.
+`parent_id`, `attempt`, `lease_owner`, `lease_until`.
+`events` — append-only журнал: создание, lease, ответ, смена состояния, возврат
+протухшего lease. По нему считаются время в очереди и исполнения, повторы и статистика.
+`workers` — реестр слотов: `<agent>#<slot>`, хост, pid, модель, harness, состояние,
+текущее сообщение, heartbeat.
 
 Типы: `task`, `fix`, `question`, `note` (работа), `result`, `verdict`, `ack` (ответы).
 Состояния: `queued → leased → done | failed | cancelled`.
 
-Выдача — `update ... where id = (select ... for update skip locked)`, поэтому
-несколько воркеров не возьмут одно сообщение. Протухший лиз возвращается в
-очередь при следующем `lease`, `attempt` растёт.
+Выдача идёт под коротким advisory-lock: один тред — одно исполнение (в треде не может
+быть два `leased`), сначала отправитель с меньшим числом текущих lease, затем самые
+старые сообщения. `AGENTBUS_PER_SENDER_LEASES` ограничивает число одновременных lease
+одной сессии. Протухший lease возвращается в очередь при следующей выдаче, `attempt`
+растёт.
 
 ## Сеть и безопасность
 
@@ -236,9 +332,8 @@ head -3 ~/.claude/skills/agentbus/SKILL.md
 - `/file` читает только внутри worktree сообщения; выход за пределы — 400.
 - Воркер никогда не пушит и не мержит. Ревью — Claude, мерж — человек.
 
-## Границы v1
+## Границы v2
 
-Сознательно не сделано: авторизация по агентам, ретраи по классам ошибок,
-автомерж, метрики, веб-интерфейс, Kafka. Транспорт — Postgres; если появится
-второй потребитель того же потока или несколько машин, к нему добавляется
-журнал событий, а таблица состояний остаётся.
+Сознательно не сделано: авторизация по агентам, ретраи по классам ошибок, автомерж,
+метрики, отмена тикета из дашборда, Kafka. Транспорт — Postgres; журнал событий живёт
+рядом с таблицей состояний и переживает удаление сообщений.
