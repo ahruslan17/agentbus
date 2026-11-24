@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import uuid
+import warnings
+from collections.abc import Iterator
 
 import psycopg
 import pytest
@@ -14,16 +17,31 @@ from agentbus import store
 from agentbus.api import create_app
 from agentbus.config import Settings
 
-TEST_URL = os.environ.get(
-    "AGENTBUS_TEST_DATABASE_URL", "postgresql://agentbus:agentbus@127.0.0.1:5455/agentbus_test"
-)
+POSTGRES_URL = "postgresql://agentbus:agentbus@127.0.0.1:5455"
+TEST_DATABASE_URL_ENV = "AGENTBUS_TEST_DATABASE_URL"
+PER_RUN_DB_NAME = f"agentbus_test_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+
+# Parallel runs in separate worktrees must not share one database: messages and
+# `truncate` from one run would corrupt another. Every run therefore gets its own
+# database unless the caller pins one explicitly.
+OWN_DATABASE = TEST_DATABASE_URL_ENV not in os.environ
+TEST_URL = os.environ.get(TEST_DATABASE_URL_ENV, f"{POSTGRES_URL}/{PER_RUN_DB_NAME}")
 ADMIN_URL = TEST_URL.rsplit("/", 1)[0] + "/postgres"
 DB_NAME = TEST_URL.rsplit("/", 1)[1]
 TOKEN = "test-token"
 
 
+def _drop_database() -> None:
+    """Drop this run's database; a failure here must not fail the test run."""
+    try:
+        with psycopg.connect(ADMIN_URL, autocommit=True) as conn:
+            conn.execute(f'drop database if exists "{DB_NAME}" with (force)')
+    except psycopg.Error as exc:  # pragma: no cover - cleanup must never fail the run
+        warnings.warn(f"could not drop test database {DB_NAME}: {exc}", stacklevel=2)
+
+
 @pytest.fixture(scope="session", autouse=True)
-def database() -> None:
+def database() -> Iterator[None]:
     try:
         with psycopg.connect(ADMIN_URL, autocommit=True) as conn:
             if (
@@ -33,8 +51,13 @@ def database() -> None:
                 conn.execute(f'create database "{DB_NAME}"')
     except psycopg.OperationalError as exc:  # pragma: no cover - environment dependent
         pytest.skip(f"postgres is not available: {exc}")
-    with store.connect(TEST_URL) as conn:
-        store.init_schema(conn)
+    try:
+        with store.connect(TEST_URL) as conn:
+            store.init_schema(conn)
+        yield
+    finally:
+        if OWN_DATABASE:
+            _drop_database()
 
 
 @pytest.fixture()
