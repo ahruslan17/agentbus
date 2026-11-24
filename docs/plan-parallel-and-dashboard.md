@@ -161,7 +161,8 @@ N потоков, каждый — текущий цикл `lease → handle`. `
 | T2 | `cb`: выбор ящика, `init`, `send --wait-id`, `wait --any/--all`, `ticket` в inbox, `--accept/--rework` + тесты | T1 |
 | T3 | `store` lease: advisory lock, сериализация треда, справедливость, потолок на отправителя, `owner` + тесты на Postgres | — |
 | T3b | миграция `events` + `workers`, запись событий в `store`, `pg_notify` + тесты | — |
-| T4 | worker: N слотов, `lease_owner` со слотом, регистрация в `workers`, locks по репо, построчный flush `run.log`, сумма токенов, `model`/`harness` в meta, корректная остановка, **коммит результата в ветку треда** (сейчас worker делает только `git add -A`, ветка `agentbus/<thread>` остаётся пустой и мерж идёт через `git apply` патча) + тесты | T3, T3b |
+| T4 | worker: N слотов, `lease_owner` со слотом, регистрация в `workers`, locks по репо, корректная остановка + тесты (`tests/test_worker.py` с фейковым opencode) | T3, T3b |
+| T4b | worker: **коммит результата в ветку треда** (сейчас только `git add -A`, ветка пустая, а самокоммит исполнителя даёт пустой патч), накопленный `patch.diff` + `attempt.diff`, построчный flush `run.log`, сумма токенов, `model`/`harness` в meta + тесты | T4 |
 | T5 | API для дашборда: GET-эндпоинты, парсер `run.log`, SSE с общим LISTEN, cookie-вход, проверка Host + тесты | T3b |
 | T6 | UI v1: страницы «Сейчас», «Тред» (таймлайн, дифф, живая лента) | T5 |
 | T7 | UI v1: «Ящики», «История», «Статистика» | T5 |
