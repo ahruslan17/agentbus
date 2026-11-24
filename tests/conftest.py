@@ -61,6 +61,7 @@ def settings(clean: None, artifacts: str) -> Settings:
         bind_host="127.0.0.1",
         bind_port=0,
         artifacts_dir=artifacts,
+        allowed_hosts=("testserver",),
     )
 
 

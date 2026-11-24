@@ -31,9 +31,19 @@ class Settings:
     bind_host: str
     bind_port: int
     artifacts_dir: str
+    # Hosts accepted in the HTTP `Host` header (DNS rebinding guard). Empty means
+    # "derive from bind_port"; kept defaulted so older constructors still work.
+    allowed_hosts: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> Settings:
+        port = _int("AGENTBUS_BIND_PORT", 8787)
+        raw_hosts = os.environ.get("AGENTBUS_ALLOWED_HOSTS", "").strip()
+        allowed_hosts = (
+            tuple(part.strip() for part in raw_hosts.split(",") if part.strip())
+            if raw_hosts
+            else (f"127.0.0.1:{port}", f"localhost:{port}")
+        )
         return cls(
             database_url=os.environ.get("AGENTBUS_DATABASE_URL", DEFAULT_DATABASE_URL),
             token=_required("AGENTBUS_TOKEN"),
@@ -41,10 +51,11 @@ class Settings:
             per_sender_leases=_int("AGENTBUS_PER_SENDER_LEASES", 0),
             max_wait_seconds=_int("AGENTBUS_MAX_WAIT", 120),
             bind_host=os.environ.get("AGENTBUS_BIND_HOST", "127.0.0.1"),
-            bind_port=_int("AGENTBUS_BIND_PORT", 8787),
+            bind_port=port,
             artifacts_dir=os.environ.get(
                 "AGENTBUS_ARTIFACTS_DIR", "~/.local/state/agentbus/artifacts"
             ),
+            allowed_hosts=allowed_hosts,
         )
 
 

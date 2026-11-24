@@ -7,17 +7,22 @@ import time
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi import Path as PathParam
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from agentbus import store
+from agentbus import runlog, store
 from agentbus.config import Settings
 
 MAX_FILE_BYTES = 256 * 1024
+MAX_LOG_BYTES = 2 * 1024 * 1024
 POLL_INTERVAL = 0.25
 WORKER_ID_PATTERN = r"^[A-Za-z0-9._#-]+$"
+UI_DIR = Path(__file__).resolve().parent / "ui"
+TOKEN_COOKIE = "agentbus_token"
 
 
 class SendRequest(BaseModel):
@@ -59,16 +64,46 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="agentbus", version="0.1.0")
     app.state.settings = settings
     app.state.artifacts_dir = Path(settings.artifacts_dir).expanduser()
+    allowed_hosts = set(_allowed_hosts(settings))
 
     def current_settings() -> Settings:
         return app.state.settings
 
-    def authorized(authorization: Annotated[str | None, Header()] = None) -> None:
+    @app.middleware("http")
+    async def enforce_host(request: Request, call_next):
+        # Bind to loopback is not enough: a browser can be tricked into resolving a
+        # foreign name to 127.0.0.1 (DNS rebinding). Only our own names may talk here.
+        host = request.headers.get("host", "")
+        if host not in allowed_hosts:
+            return JSONResponse({"detail": "bad host"}, status_code=421)
+        return await call_next(request)
+
+    def authorized(request: Request, authorization: Annotated[str | None, Header()] = None) -> None:
         expected = f"Bearer {current_settings().token}"
-        if not authorization or not secrets.compare_digest(authorization, expected):
-            raise HTTPException(status_code=401, detail="bad token")
+        if authorization and secrets.compare_digest(authorization, expected):
+            return
+        # The browser session may only read; writes still need the Bearer token.
+        if request.method == "GET":
+            cookie = request.cookies.get(TOKEN_COOKIE, "")
+            if cookie and secrets.compare_digest(cookie, current_settings().token):
+                return
+        raise HTTPException(status_code=401, detail="bad token")
 
     guard = Depends(authorized)
+
+    @app.get("/ui/login")
+    def ui_login(token: str = Query(default="")):
+        if not token or not secrets.compare_digest(token, current_settings().token):
+            raise HTTPException(status_code=401, detail="bad token")
+        response = RedirectResponse(url="/ui/", status_code=303)
+        response.set_cookie(
+            TOKEN_COOKIE,
+            current_settings().token,
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+        return response
 
     @app.get("/v1/health")
     def health() -> dict[str, Any]:
@@ -247,7 +282,117 @@ def create_app(settings: Settings) -> FastAPI:
             "content": data[:MAX_FILE_BYTES].decode("utf-8", errors="replace"),
         }
 
+    @app.get("/v1/overview", dependencies=[guard])
+    def get_overview() -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return store.overview(conn, lease_ttl_seconds=current_settings().lease_ttl_seconds)
+
+    @app.get("/v1/mailboxes", dependencies=[guard])
+    def get_mailboxes() -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return {"mailboxes": store.mailboxes(conn)}
+
+    @app.get("/v1/threads", dependencies=[guard])
+    def get_threads(
+        mailbox: str | None = Query(default=None, max_length=64),
+        repo: str | None = Query(default=None),
+        state: Literal["active", "review", "done", "failed"] | None = Query(default=None),
+        q: str | None = Query(default=None, max_length=200),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return {
+                "threads": store.list_threads(
+                    conn,
+                    mailbox=mailbox,
+                    repo=repo,
+                    state=state,
+                    q=q,
+                    limit=limit,
+                    offset=offset,
+                )
+            }
+
+    @app.get("/v1/threads/{thread_id}/timeline", dependencies=[guard])
+    def get_timeline(thread_id: str) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            timeline = store.thread_timeline(conn, thread_id)
+        if timeline is None:
+            raise HTTPException(status_code=404, detail="unknown thread")
+        for message in timeline["messages"]:
+            message["artifacts"] = _artifact_files(app.state.artifacts_dir, str(message["id"]))
+        return timeline
+
+    @app.get("/v1/messages/{message_id}/log", dependencies=[guard])
+    def get_log(message_id: str, after: int = Query(default=0, ge=0)) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            row = store.get_message(conn, message_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="unknown message")
+            running = row["state"] == "leased"
+            path = _run_log_path(app.state.artifacts_dir, conn, message_id)
+        if path is None:
+            return {"lines": [], "next": after, "running": running}
+        selected = _read_log_lines(path, after)
+        return {
+            "lines": runlog.parse_lines(selected, start=after),
+            "next": after + len(selected),
+            "running": running,
+        }
+
+    @app.get("/v1/stats", dependencies=[guard])
+    def get_stats(
+        group: Literal["mailbox", "repo", "model"] = Query(...),
+    ) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return {"group": group, "rows": store.stats(conn, group)}
+
+    app.mount("/ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
+
     return app
+
+
+def _allowed_hosts(settings: Settings) -> tuple[str, ...]:
+    if settings.allowed_hosts:
+        return settings.allowed_hosts
+    return (f"127.0.0.1:{settings.bind_port}", f"localhost:{settings.bind_port}")
+
+
+def _artifact_files(root: Path, message_id: str) -> list[str]:
+    directory = root / message_id
+    if not directory.is_dir():
+        return []
+    return sorted(path.name for path in directory.iterdir() if path.is_file())
+
+
+def _run_log_path(root: Path, conn, message_id: str) -> Path | None:
+    direct = root / message_id / "run.log"
+    if direct.is_file():
+        return direct
+    reply_id = store.first_reply_id(conn, message_id)
+    if reply_id:
+        # The worker moves artifacts under the reply id once the answer exists.
+        reply_log = root / reply_id / "run.log"
+        if reply_log.is_file():
+            return reply_log
+    return None
+
+
+def _read_log_lines(path: Path, after: int) -> list[str]:
+    """Read at most MAX_LOG_BYTES of the tail, starting at file line `after`."""
+    selected: list[str] = []
+    size = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for index, line in enumerate(handle):
+            if index < after:
+                continue
+            grown = size + len(line.encode("utf-8"))
+            if selected and grown > MAX_LOG_BYTES:
+                break
+            selected.append(line)
+            size = grown
+    return selected
 
 
 def _worktree_root(conn, row: dict[str, Any]) -> Path | None:

@@ -451,3 +451,328 @@ def list_workers(conn: psycopg.Connection, *, lease_ttl_seconds: int) -> list[di
         """,
         (lease_ttl_seconds * 2,),
     ).fetchall()
+
+
+# --- dashboard reads -------------------------------------------------------------
+
+
+def overview(conn: psycopg.Connection, *, lease_ttl_seconds: int) -> dict[str, Any]:
+    """Everything the "now" page needs: slots, queues and the last events."""
+    queues = conn.execute(
+        """
+        select recipient,
+               count(*) filter (where state = 'queued') as queued,
+               count(*) filter (where state = 'leased') as leased
+          from messages
+         where state in ('queued', 'leased')
+         group by recipient
+         order by recipient
+        """
+    ).fetchall()
+    awaiting = conn.execute(
+        """
+        select recipient, count(*) as count
+          from messages
+         where kind = 'result' and state = 'queued'
+         group by recipient
+         order by recipient
+        """
+    ).fetchall()
+    return {
+        "workers": list_workers(conn, lease_ttl_seconds=lease_ttl_seconds),
+        "queues": queues,
+        "awaiting_review": awaiting,
+        "recent_events": recent_events(conn, limit=20),
+    }
+
+
+def mailboxes(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """One card per session that ever sent a task."""
+    return conn.execute(
+        """
+        with boxes as (
+            select sender as mailbox,
+                   array_agg(distinct thread_id) filter (where thread_id is not null) as threads
+              from messages
+             where kind = 'task'
+             group by sender
+        )
+        select b.mailbox,
+               (select count(*) from messages m
+                 where m.sender = b.mailbox and m.kind = 'task') as tasks,
+               (select count(distinct m.thread_id) from messages m
+                 where m.thread_id = any(b.threads) and m.state = 'leased') as in_work,
+               (select count(*) from messages m
+                 where m.thread_id = any(b.threads)
+                   and m.kind = 'result' and m.state = 'queued') as awaiting_review,
+               (select count(*) from messages m
+                 where m.thread_id = any(b.threads)
+                   and m.kind = 'result'
+                   and m.meta->>'state_note' like 'accept%') as accepted,
+               (select count(*) from messages m
+                 where m.thread_id = any(b.threads) and m.state = 'failed') as failed,
+               (select max(m.updated_at) from messages m
+                 where m.thread_id = any(b.threads)) as last_activity
+          from boxes b
+         order by b.mailbox
+        """
+    ).fetchall()
+
+
+THREAD_STATE_FILTERS = {
+    "active": (
+        "exists (select 1 from messages m "
+        "where m.thread_id = t.id and m.state in ('queued', 'leased'))"
+    ),
+    "review": "last.kind = 'result' and last.state = 'queued'",
+    "done": (
+        "not exists (select 1 from messages m "
+        "where m.thread_id = t.id and m.state in ('queued', 'leased')) "
+        "and not exists (select 1 from messages m "
+        "where m.thread_id = t.id and m.state = 'failed')"
+    ),
+    "failed": "exists (select 1 from messages m where m.thread_id = t.id and m.state = 'failed')",
+}
+
+
+def list_threads(
+    conn: psycopg.Connection,
+    *,
+    mailbox: str | None = None,
+    repo: str | None = None,
+    state: str | None = None,
+    q: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """History page: one row per thread with the facts a table shows."""
+    conditions: list[str] = []
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if mailbox:
+        conditions.append(
+            "(t.created_by = %(mailbox)s or exists ("
+            "select 1 from messages m where m.thread_id = t.id "
+            "and m.kind = 'task' and m.sender = %(mailbox)s))"
+        )
+        params["mailbox"] = mailbox
+    if repo:
+        conditions.append("t.repo = %(repo)s")
+        params["repo"] = repo
+    if state:
+        if state not in THREAD_STATE_FILTERS:
+            raise ValueError(f"unknown thread state: {state}")
+        conditions.append(f"({THREAD_STATE_FILTERS[state]})")
+    if q:
+        conditions.append(
+            "exists (select 1 from messages m where m.thread_id = t.id and m.body ilike %(q)s)"
+        )
+        params["q"] = f"%{q}%"
+    where = "where " + " and ".join(conditions) if conditions else ""
+
+    rows = conn.execute(
+        f"""
+        select t.id, t.repo, t.created_by,
+               task.meta->>'ticket' as ticket,
+               task.body as first_body,
+               counts.messages,
+               coalesce(counts.attempts, 0) as attempts,
+               last.kind as last_kind,
+               last.state as last_state,
+               coalesce(counts.updated_at, t.created_at) as updated_at,
+               last_result.meta->>'model' as model
+          from threads t
+          left join lateral (
+                select m.meta, m.body from messages m
+                 where m.thread_id = t.id and m.kind = 'task'
+                 order by m.created_at, m.id
+                 limit 1
+          ) task on true
+          left join lateral (
+                select count(*) as messages, max(m.attempt) as attempts,
+                       max(m.updated_at) as updated_at
+                  from messages m
+                 where m.thread_id = t.id
+          ) counts on true
+          left join lateral (
+                select m.kind, m.state from messages m
+                 where m.thread_id = t.id
+                 order by m.created_at desc, m.id desc
+                 limit 1
+          ) last on true
+          left join lateral (
+                select m.meta from messages m
+                 where m.thread_id = t.id and m.kind = 'result'
+                 order by m.created_at desc, m.id desc
+                 limit 1
+          ) last_result on true
+          {where}
+         order by updated_at desc, t.id desc
+         limit %(limit)s offset %(offset)s
+        """,
+        params,
+    ).fetchall()
+    for row in rows:
+        row["title"] = _first_line(row.pop("first_body", None))
+    return rows
+
+
+def thread_timeline(conn: psycopg.Connection, thread_id: str) -> dict[str, Any] | None:
+    thread = get_thread(conn, thread_id)
+    if thread is None:
+        return None
+    return {
+        "thread": thread,
+        "messages": thread_messages(conn, thread_id),
+        "events": thread_events(conn, thread_id),
+    }
+
+
+def first_reply_id(conn: psycopg.Connection, message_id: str) -> str | None:
+    """The result that answers `message_id`, if any. Artifacts move under its id."""
+    row = conn.execute(
+        """
+        select id from messages
+         where parent_id = %s and kind = 'result'
+         order by created_at, id
+         limit 1
+        """,
+        (message_id,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+# Per-thread facts shared by every statistic. A thread belongs to one mailbox (the
+# sender of its first task), one repo and one model (the one of its latest result).
+_STATS_FACTS = """
+with facts as (
+    select t.id as thread_id,
+           t.repo as repo,
+           (select m.sender from messages m
+             where m.thread_id = t.id and m.kind = 'task'
+             order by m.created_at, m.id limit 1) as mailbox,
+           (select m.meta->>'model' from messages m
+             where m.thread_id = t.id and m.kind = 'result'
+             order by m.created_at desc, m.id desc limit 1) as model,
+           exists (select 1 from messages m
+                    where m.thread_id = t.id and m.kind = 'task') as has_task,
+           exists (select 1 from messages m
+                    where m.thread_id = t.id and m.state = 'failed') as failed,
+           (select count(*) from messages m
+             where m.thread_id = t.id and m.kind = 'result') as results,
+           coalesce((select case when (m.meta->>'state_note') like 'accept%' then 1 else 0 end
+                       from messages m
+                      where m.thread_id = t.id and m.kind = 'result'
+                      order by m.created_at, m.id limit 1), 0) as accepted_first,
+           (select count(*) from messages m
+             where m.thread_id = t.id and m.kind = 'verdict'
+               and m.meta->>'decision' = 'rework') as rework,
+           (select count(*) from messages m
+             where m.thread_id = t.id and m.kind = 'result'
+               and m.meta->>'timeout' = 'true') as timeouts,
+           (select sum(nullif(m.meta->'usage'->'tokens'->>'input', '')::bigint)
+              from messages m
+             where m.thread_id = t.id and m.kind = 'result') as tokens_input,
+           (select sum(nullif(m.meta->'usage'->'tokens'->>'output', '')::bigint)
+              from messages m
+             where m.thread_id = t.id and m.kind = 'result') as tokens_output
+      from threads t
+)
+"""
+
+_STATS_KEYS = {"mailbox": "mailbox", "repo": "repo", "model": "model"}
+
+
+def stats(conn: psycopg.Connection, group: str) -> list[dict[str, Any]]:
+    """Acceptance and throughput per mailbox, repo or model. Empty cells are null."""
+    if group not in _STATS_KEYS:
+        raise ValueError(f"unknown stats group: {group}")
+    key = f"facts.{_STATS_KEYS[group]}"
+
+    counters = conn.execute(
+        _STATS_FACTS
+        + f"""
+        select {key} as key,
+               sum(case when has_task then 1 else 0 end)::bigint as tickets,
+               sum(results)::bigint as results,
+               sum(accepted_first)::bigint as accepted_first_review,
+               sum(rework)::bigint as rework_verdicts,
+               sum(timeouts)::bigint as timeouts,
+               sum(case when failed then 1 else 0 end)::bigint as failed,
+               sum(tokens_input)::bigint as tokens_input,
+               sum(tokens_output)::bigint as tokens_output
+          from facts
+         where {key} is not null
+         group by 1
+         order by 1
+        """
+    ).fetchall()
+
+    queue = conn.execute(
+        _STATS_FACTS
+        + f"""
+        select {key} as key,
+               percentile_cont(0.5) within group (
+                   order by extract(epoch from (leased.at - m.created_at))
+               ) as median_queue_seconds
+          from messages m
+          join lateral (
+                select e.at from events e
+                 where e.message_id = m.id and e.kind = 'leased'
+                 order by e.id
+                 limit 1
+          ) leased on true
+          join facts on facts.thread_id = m.thread_id
+         where m.kind in ('task', 'fix') and {key} is not null
+         group by 1
+         order by 1
+        """
+    ).fetchall()
+
+    run = conn.execute(
+        _STATS_FACTS
+        + f"""
+        select {key} as key,
+               percentile_cont(0.5) within group (
+                   order by extract(epoch from (r.created_at - leased.at))
+               ) as median_run_seconds
+          from messages r
+          join lateral (
+                select e.at from events e
+                 where e.message_id = r.parent_id and e.kind = 'leased'
+                   and e.at <= r.created_at
+                 order by e.id desc
+                 limit 1
+          ) leased on true
+          join facts on facts.thread_id = r.thread_id
+         where r.kind = 'result' and {key} is not null
+         group by 1
+         order by 1
+        """
+    ).fetchall()
+
+    rows: dict[str, dict[str, Any]] = {
+        row["key"]: {
+            **row,
+            "median_queue_seconds": None,
+            "median_run_seconds": None,
+        }
+        for row in counters
+    }
+    for row in queue:
+        rows.setdefault(row["key"], {"key": row["key"]})["median_queue_seconds"] = row[
+            "median_queue_seconds"
+        ]
+    for row in run:
+        rows.setdefault(row["key"], {"key": row["key"]})["median_run_seconds"] = row[
+            "median_run_seconds"
+        ]
+    for row in rows.values():
+        for field in ("median_queue_seconds", "median_run_seconds"):
+            value = row.get(field)
+            row[field] = round(float(value), 1) if value is not None else None
+    return [rows[key_value] for key_value in sorted(rows)]
+
+
+def _first_line(body: Any) -> str:
+    text = str(body or "").strip()
+    return text.splitlines()[0][:160] if text else ""
