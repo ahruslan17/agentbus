@@ -5,7 +5,7 @@ Requires=agentbus-api.service
 
 [Service]
 Type=simple
-ExecStart=%h/personal/agentbus/bin/agentbus-bridge
+ExecStart=%h/agentbus/bin/agentbus-bridge
 Restart=on-failure
 RestartSec=5
 

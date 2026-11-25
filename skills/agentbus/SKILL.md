@@ -1,103 +1,108 @@
 ---
 name: agentbus
-description: "Постановка задач исполнителю OpenCode на хосте через локальную очередь agentbus: несколько ящиков, параллельные тикеты, ожидание ответов и приём результата. Используй, когда нужно делегировать реализацию, отправить задачу «исполнителю», раздать независимые тикеты параллельно, дождаться ответов, отревьюить дифф и выдать вердикт. Триггеры: agentbus, cb, исполнитель, opencode, делегировать задачу, параллельные тикеты, ждать ответа, принять результат, verdict."
+description: "Delegating tasks to an OpenCode executor on the host through the local agentbus queue: several mailboxes, parallel tickets, waiting for replies and accepting the result. Use when you need to delegate implementation, send a task to an executor, fan out independent tickets in parallel, wait for replies, review the diff and issue a verdict. Triggers: agentbus, cb, executor, opencode, delegate task, parallel tickets, wait for reply, accept result, verdict."
 ---
 
 # agentbus
 
-Ты постановщик и ревьюер. Исполнитель — OpenCode на хосте — делает работу в
-отдельном git-worktree и возвращает отчёт с диффом. Исполнителей несколько: на хосте
-работает пул слотов, поэтому независимые тикеты можно ставить сразу. Сети у тебя нет:
-обмен идёт через каталог, который Cage уже отдал в VM.
+You are the planner and reviewer. The executor — OpenCode on the host — does the work
+in a separate git worktree and returns a report with a diff. There are several
+executors: a pool of slots runs on the host, so independent tickets can be dispatched
+right away. You have no network: everything goes through a directory that Cage has
+already shared into the VM.
 
-## Инструменты
+## Tools
 
-- Клиент: `/home/ruslan/personal/agentbus/bin/cb` (python3, ставить нечего).
-- `cb env` — какой ящик выбран, откуда, пути и число непрочитанных.
-- `AGENTBUS_SHARE` в каждой команде не нужен, если ящик определяется сам.
+- Client: `<agentbus checkout>/bin/cb` (python3, nothing to install). Either put it on
+  PATH or set `CB=~/agentbus/bin/cb`.
+- `cb env` — which mailbox is selected, why, the paths and the unread count.
+- `AGENTBUS_SHARE` is not needed on every command when the mailbox picks itself.
 
-## Ящик
+## Mailbox
 
-`cb` выбирает ящик по приоритету:
+`cb` selects a mailbox in this order:
 
-1. `AGENTBUS_SHARE` — полный путь к папке ящика;
-2. `AGENTBUS_MAILBOX=<имя>` — `<корень>/<имя>`;
-3. внутри git-репозитория — `claude-<имя папки репозитория>`;
-4. иначе `cage-claude`.
+1. `AGENTBUS_SHARE` — full path to the mailbox folder;
+2. `AGENTBUS_MAILBOX=<name>` — `<root>/<name>`;
+3. inside a git repository — `claude-<repository folder name>`;
+4. otherwise `cage-claude`.
 
-Задавай `AGENTBUS_MAILBOX` явно — в env сессии или в каждой команде: иначе при смене
-cwd (открыл другой проект) ответы могут уехать в другой ящик. `cb env` показывает
-выбранный ящик и причину выбора.
+Set `AGENTBUS_MAILBOX` explicitly — in the session env or on every command: otherwise
+changing cwd (opening another project) can route replies to a different mailbox.
+`cb env` prints the selected mailbox and the reason for the choice.
 
-## Поставить задачу
+## Sending a task
 
 ```bash
-CB=/home/ruslan/personal/agentbus/bin/cb
+CB=~/agentbus/bin/cb
 
 $CB send --to local-opencode \
-  --repo /home/ruslan/personal/real-inflation \
-  --meta '{"ticket":"T3","acceptance":["make check зелёный","тесты на новый случай"],"scope_files":["src/agentbus/"],"checks":true}' \
-  --body "Реализуй T3 по docs/specs/T3.md. Только файлы из спеки."
+  --repo /path/to/repo \
+  --meta '{"ticket":"T3","acceptance":["make check is green","tests for the new case"],"scope_files":["src/agentbus/"],"checks":true}' \
+  --body "Implement T3 per docs/specs/T3.md. Only the files listed in the spec."
 ```
 
-`cb send` печатает `id` и `thread_id` по квитанции моста. `--wait-id N` задаёт, сколько
-секунд её ждать (`0` — не ждать). Квитанции нет — печатается всё известное и
-предупреждение в stderr.
+`cb send` prints `id` and `thread_id` from the bridge receipt. `--wait-id N` sets how
+many seconds to wait for it (`0` — do not wait). Without a receipt it prints everything
+it knows plus a warning on stderr.
 
-Что обязательно в `meta`:
+What `meta` must contain:
 
-- `ticket` — короткое имя тикета, видно в `cb inbox` и в дашборде;
-- `acceptance` — критерии приёмки списком. Без них исполнитель додумает критерии сам;
-- `scope_files` — где работать, чтобы он не расползся по репозиторию.
+- `ticket` — short ticket name, shown in `cb inbox` and on the dashboard;
+- `acceptance` — acceptance criteria as a list. Without them the executor invents its
+  own;
+- `scope_files` — where to work, so it does not spread across the repository.
 
-По необходимости: `checks: true` — запустить `make check` в worktree (дорого: поднимает
-Docker); `checks_parallel: true` — если тесты проекта изолированы и не мешают друг
-другу, тогда проверка не берёт блокировку репозитория.
+Optional: `checks: true` — run `make check` in the worktree (expensive: starts Docker);
+`checks_parallel: true` — when the project's tests are isolated and do not interfere,
+so the check does not take the repository lock.
 
-`--repo` — абсолютный путь. Исполнитель пускает только `/home/ruslan/personal` и
-`/home/ruslan/gg`, остальное отвергнет. `--base` — от какой ветки/коммита (по умолчанию
-текущая ветка репозитория). `--thread <id>` — продолжить существующий тред вместо
-нового. `--kind task` (по умолчанию) или `question` для вопросов без правок в коде.
+`--repo` is an absolute path. The executor only accepts whatever the host sets in
+`AGENTBUS_REPOS`; anything else is rejected. `--base` — the branch or commit to start
+from (defaults to the repository's current branch). `--thread <id>` — continue an
+existing thread instead of opening a new one. `--kind task` (default) or `question` for
+questions that need no code changes.
 
-## Параллельно
+## Parallelism
 
-Пул исполнителей задаётся `AGENTBUS_WORKER_SLOTS` на хосте; каждый слот — отдельный
-lease owner `<agent>#<slot>` и свой worktree на тред.
+The executor pool is configured by `AGENTBUS_WORKER_SLOTS` on the host; each slot is a
+separate lease owner `<agent>#<slot>` with its own worktree per thread.
 
-- Независимые тикеты (непересекающиеся `scope_files`, разные треды) отправляй сразу:
-  свободные слоты разберут их одновременно.
-- Зависимый тикет отправляй только после того, как предыдущий принят и влит в основную
-  ветку, иначе получишь конфликт на пустом месте.
-- Один тред — одно исполнение: очередь не выдаст второе сообщение треда, пока в нём
-  есть `leased`. Справедливость между сессиями (сначала отправитель с меньшим числом
-  текущих lease) обеспечивает очередь, не ты.
-- Не отправляй две задачи в один тред «для скорости» — они выстроятся в очередь.
+- Send independent tickets (non-overlapping `scope_files`, different threads) right
+  away: free slots pick them up simultaneously.
+- Send a dependent ticket only after the previous one is accepted and merged into the
+  main branch, otherwise you get a conflict for no reason.
+- One thread, one execution: the queue will not hand out a second message of a thread
+  while one is `leased`. Fairness between sessions (the sender with fewer current
+  leases first) is the queue's job, not yours.
+- Do not send two tasks into one thread "for speed" — they will just queue up.
 
-## Ожидание
+## Waiting
 
 ```bash
 $CB wait <id> [<id> ...] [--all] [--timeout 600]
 ```
 
-`cb wait` ждёт в своём ящике ответы с `parent_id` из переданных id: по умолчанию
-возвращается после первого, с `--all` — после всех, `--timeout` (по умолчанию 3600
-секунд) завершает с кодом 2. Строка ответа содержит тикет, `checks=ok|fail|-` и
-`timeout=true|false`. Опрос `cb inbox` в цикле не нужен. Если мост успевает писать
-`status.json`, `cb wait` дополнительно печатает в stderr переходы состояния ожидаемых
-сообщений: `m_… queued → leased by local-opencode#1`.
+`cb wait` waits in its own mailbox for replies with a `parent_id` among the given ids:
+by default it returns after the first one, with `--all` — after all of them, and
+`--timeout` (3600 seconds by default) exits with code 2. A reply line contains the
+ticket, `checks=ok|fail|-` and `timeout=true|false`. Polling `cb inbox` in a loop is not
+needed. When the bridge manages to write `status.json`, `cb wait` also prints state
+transitions of the awaited messages on stderr:
+`m_… queued → leased by local-opencode#1`.
 
-## Состояние
+## State
 
 ```bash
-$CB status                 # свежесть status.json, слоты, мои сообщения
-$CB status m_... --log     # только эти сообщения, с хвостом run.log у занятых
-$CB status --json          # сырой файл
+$CB status                 # status.json freshness, slots, my messages
+$CB status m_... --log     # only these messages, with the run.log tail of busy ones
+$CB status --json          # the raw file
 ```
 
-Мост раз в `AGENTBUS_STATUS_INTERVAL` секунд переписывает `<ящик>/status.json`:
-слоты пула, очереди по ящикам, сообщения этого ящика и последние события его тредов.
-`cb status` читает файл, а не API, поэтому показывает состояние с задержкой до
-интервала.
+Every `AGENTBUS_STATUS_INTERVAL` seconds the bridge rewrites `<mailbox>/status.json`:
+pool slots, queues per mailbox, this mailbox's messages and the latest events of its
+threads. `cb status` reads the file rather than the API, so it shows state delayed by up
+to one interval.
 
 ```
 status: 3s ago
@@ -108,86 +113,96 @@ m_… [T12] queued, ~2nd in line
 m_… [T13] done → result m_…
 ```
 
-- `queued, ~2nd in line` — оценка по числу сообщений того же получателя, созданных
-  раньше; очередь честнее, чем эта цифра, поэтому lease может обогнать.
-- `leased by <слот>, attempt N` — кто взял и какая попытка.
-- `done → result m_…` — сообщение закрыто ответом; `failed`/`cancelled` без стрелки.
+- `queued, ~2nd in line` — an estimate based on the number of earlier messages for the
+  same recipient; the queue is more accurate than this number, so a lease can overtake
+  it.
+- `leased by <slot>, attempt N` — who took it and which attempt.
+- `done → result m_…` — the message is closed by a reply; `failed`/`cancelled` have no
+  arrow.
 
-`status is stale (Ns) — bridge or API down?` и код 2 — файл старше
-`max(30, 6*interval)` секунд или его нет. Это значит, что мост или API не работают;
-задача при этом не потеряна — она остаётся в очереди. `cb env` показывает возраст
-файла. Про чужой занятый слот видно только имя ящика (`sender`), тикет и текст чужой
-задачи в файл не попадают.
+`status is stale (Ns) — bridge or API down?` with exit code 2 means the file is older
+than `max(30, 6*interval)` seconds or missing. The bridge or the API is not running; the
+task is not lost — it stays in the queue. `cb env` shows the file's age. For someone
+else's busy slot you only see the mailbox name (`sender`); the ticket and text of
+another agent's task never make it into the file.
 
-## Забрать результат
+## Collecting the result
 
 ```bash
-$CB inbox                      # что пришло: id, тип, отправитель, тикет, первая строка
-$CB show <id> --text           # отчёт и diff_stat
+$CB inbox                      # what arrived: id, kind, sender, ticket, first line
+$CB show <id> --text           # report and diff_stat
 $CB show <id> | jq .meta       # branch, files_changed, checks, usage, model, harness
-$CB patch <id>                 # накопленный дифф треда
-cat /home/ruslan/personal/.agentbus/<ящик>/inbox/<id>/attempt.diff   # дифф только последней попытки
+$CB patch <id>                 # the thread's accumulated diff
+cat ~/.agentbus/<mailbox>/inbox/<id>/attempt.diff   # diff of the last attempt only
 ```
 
-Исполнитель работает в ветке `agentbus/<thread_id>`. Он не пушит и не мержит.
+The executor works on the `agentbus/<thread_id>` branch. It does not push and does not
+merge.
 
-## Ревью
+## Review
 
-- Смотри дифф, а не только текст отчёта: `patch` — накопленный дифф треда,
-  `attempt.diff` — только последняя попытка. Отчёт может быть бодрее реальности.
-- `meta.checks` — результат `make check` в worktree (`ok`, `exit_code`, хвост вывода).
-- `meta.usage` — шаги, tool calls, токены и стоимость прогона.
-- `exit_code 143` — исполнителя убили сигналом (таймаут или остановка worker). Пиши
-  вердикт «продолжи с текущего состояния», контекст и worktree сохранены.
+- Look at the diff, not just the report text: `patch` is the thread's accumulated diff,
+  `attempt.diff` only the last attempt. Reports can be rosier than reality.
+- `meta.checks` — the `make check` result in the worktree (`ok`, `exit_code`, tail of
+  the output).
+- `meta.usage` — steps, tool calls, tokens and the cost of the run.
+- `exit_code 143` — the executor was killed by a signal (timeout or worker shutdown).
+  Answer with a verdict to "continue from the current state": the context and the
+  worktree are preserved.
 
-## Вердикт и принятие
+## Verdict and acceptance
 
-Правка уйдёт в тот же worktree и ту же сессию OpenCode, контекст не потеряется:
+Your feedback goes to the same worktree and the same OpenCode session, so the context is
+preserved:
 
 ```bash
-$CB reply <id_результата> --kind verdict \
-  --body "Не хватает теста на пустой вход. И убери отладочный print в api.py:112."
+$CB reply <result_id> --kind verdict \
+  --body "There is no test for empty input. Also drop the debug print in api.py:112."
 ```
 
-`cb reply --kind verdict` по умолчанию ставит `meta.decision = "rework"` и наследует
-`ticket`. Вопрос без правок: `--kind question`. Принял результат — `$CB accept <id>
-[--note "принято"]`: это пишет `decision.json` и закрывает сообщение в очереди.
-`cb read <id>` просто убирает сообщение из inbox, не отмечая принятие.
+`cb reply --kind verdict` sets `meta.decision = "rework"` by default and inherits
+`ticket`. For a question without code changes: `--kind question`. Once you accept the
+result, run `$CB accept <id> [--note "accepted"]`: it writes `decision.json` and closes
+the message in the queue. `cb read <id>` only removes the message from the inbox without
+marking it accepted.
 
 ## Merge
 
-Worker коммитит каждую попытку в ветку `agentbus/<thread_id>`. Мержи веткой
-(`git merge --ff-only agentbus/<thread_id>` или обычный merge), не патчем: патч теряет
-историю и авторство. Исполнитель не пушит и не мержит; деплой — тоже не его дело.
+The worker commits every attempt to the `agentbus/<thread_id>` branch. Merge by branch
+(`git merge --ff-only agentbus/<thread_id>` or a regular merge), never by patch: a patch
+loses history and authorship. The executor does not push and does not merge; deployment
+is not its job either.
 
-## Чего нельзя из VM
+## What not to do from the VM
 
-- `git worktree prune` в репозиториях исполнителя. Worktree лежат на хосте в
-  `~/.local/state/agentbus/worktrees`; в VM они видны как `prunable`, но их нельзя
-  чистить — иначе сломается текущий прогон. Уборка — `make prune` на хосте (сначала с `PRUNE_ARGS=--dry-run`).
-- Пушить, мержить в `main`, переключать ветку в worktree исполнителя.
+- `git worktree prune` in executor repositories. The worktrees live on the host under
+  `~/.local/state/agentbus/worktrees`; inside the VM they look `prunable`, but cleaning
+  them breaks the running task. Cleanup is `make prune` on the host (start with
+  `PRUNE_ARGS=--dry-run`).
+- Push, merge into `main`, or switch branches in the executor's worktree.
 
-## Дашборд
+## Dashboard
 
-На хосте: `http://127.0.0.1:8787/ui/login?token=<AGENTBUS_TOKEN>`. Видно слоты, очереди
-по ящикам, тред с таймлайном, диффом, `checks.txt` и живой лентой `run.log`, историю и
-статистику по ящику, репозиторию и модели.
+On the host: `http://127.0.0.1:8787/ui/login?token=<AGENTBUS_TOKEN>`. It shows slots,
+queues per mailbox, a thread with its timeline, diff, `checks.txt` and live `run.log`,
+plus history and statistics per mailbox, repository and model.
 
-## Когда что-то не так
+## When something is wrong
 
-- `failed` — `cb show <id>` покажет `meta.state_note`: обычно репозиторий вне
-  allowlist или в постановке не было нужного поля.
-- Задача убита по таймауту — отчёт придёт с `timeout: true`, лог в `run.log`. Дроби
-  задачу мельче.
-- Ответа нет дольше пяти минут на мелкой задаче — скажи человеку: возможно, лежит
-  worker или сервис.
-- Дифф больше 256 КиБ обрезан: в `meta.patch_bytes` реальный размер, `diff_stat` и
-  `files_changed` полные.
+- `failed` — `cb show <id>` prints `meta.state_note`: usually the repository is outside
+  the allowlist or the task was missing a required field.
+- The task was killed by a timeout — the report arrives with `timeout: true`, the log is
+  in `run.log`. Split the task into smaller pieces.
+- No reply for more than five minutes on a small task — tell the human: the worker or
+  the service may be down.
+- Diffs larger than 256 KiB are truncated: `meta.patch_bytes` holds the real size
+  while `diff_stat` and `files_changed` are complete.
 
-## Чего не делать
+## What not to do
 
-- Не проси пушить, мержить в `main` или деплоить — этого не будет.
-- Не передавай секреты и токены: исполнителю они не нужны.
-- Не отправляй задачу без критерия приёмки и без указания файлов.
-- Не отправляй одну и ту же задачу дважды — это дубль. Уточняй вердиктом.
-- Не считай задачу сделанной, не увидев дифф.
+- Do not ask to push, merge into `main` or deploy — none of that will happen.
+- Do not send secrets or tokens: the executor does not need them.
+- Do not send a task without acceptance criteria and without naming the files.
+- Do not send the same task twice — that is a duplicate. Clarify with a verdict
+  instead.
+- Do not consider a task done without seeing the diff.
