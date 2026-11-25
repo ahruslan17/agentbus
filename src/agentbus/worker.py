@@ -292,34 +292,42 @@ def prepare_worktree(
 def build_prompt(message: dict[str, Any], worktree: Path | None, branch: str, policy: str) -> str:
     meta = message.get("meta") or {}
     parts = [
-        f"Ты исполнитель в паре с агентом «{message['sender']}». Сообщение пришло через очередь agentbus.",
-        f"Тред: {message.get('thread_id')}. Тип: {message.get('kind')}. Попытка: {message.get('attempt')}.",
+        (
+            f'You are the executor paired with agent "{message["sender"]}". '
+            "The message arrived through the agentbus queue."
+        ),
+        (
+            f"Thread: {message.get('thread_id')}. Kind: {message.get('kind')}. "
+            f"Attempt: {message.get('attempt')}."
+        ),
     ]
     if worktree is not None:
-        parts.append(f"Рабочее дерево: {worktree}. Ветка: {branch}.")
+        parts.append(f"Worktree: {worktree}. Branch: {branch}.")
     acceptance = meta.get("acceptance")
     if acceptance:
-        parts.append("Критерии приёмки:\n" + "\n".join(f"- {item}" for item in acceptance))
+        parts.append("Acceptance criteria:\n" + "\n".join(f"- {item}" for item in acceptance))
     scope = meta.get("scope_files")
     if scope:
-        parts.append("Файлы в области задачи:\n" + "\n".join(f"- {item}" for item in scope))
-    parts.append("--- ЗАДАЧА ---\n" + str(message["body"]).strip() + "\n--- КОНЕЦ ЗАДАЧИ ---")
+        parts.append("Files in scope:\n" + "\n".join(f"- {item}" for item in scope))
+    parts.append("--- TASK ---\n" + str(message["body"]).strip() + "\n--- END OF TASK ---")
     if policy:
         parts.append(policy.strip())
     if worktree is not None:
         parts.append(
-            "Правила:\n"
-            "- Работай только внутри этого рабочего дерева.\n"
-            "- Не делай git push, не мержи в main, не переключай ветку.\n"
-            "- Не коммить — коммит сделает worker.\n"
-            "- Запускай проверки, которые требует постановка.\n"
-            "- В конце — короткий отчёт: что сделано, какие файлы изменены, какие команды "
-            "проверки запускал и с каким результатом, что осталось неясным.\n"
-            "- Если для задачи нужно решение, которого нет в постановке, опиши варианты в "
-            "отчёте и ничего не выбирай молча."
+            "Rules:\n"
+            "- Work only inside this worktree.\n"
+            "- Do not git push, do not merge into main, do not switch branches.\n"
+            "- Do not commit: the worker will commit.\n"
+            "- Run the checks the task requires.\n"
+            "- Finish with a short report: what you did, which files you changed, which check "
+            "commands you ran and with what result, and what remains unclear.\n"
+            "- If the task needs a decision the task text does not cover, list the options in "
+            "the report and do not pick one silently."
         )
     else:
-        parts.append("Правил про git нет: задачи с кодом не было. Ответь по существу и коротко.")
+        parts.append(
+            "No git rules apply: this task had no code. Answer to the point and keep it short."
+        )
     return "\n\n".join(parts)
 
 
@@ -609,11 +617,14 @@ def handle(
                         result_meta["checks"] = run_checks(worktree, artifacts)
                 result_meta["artifacts"].append("checks.txt")
 
-        body = outcome.get("text") or "(пустой отчёт: агент не вернул текст)"
+        body = outcome.get("text") or "(empty report: the agent returned no text)"
         if outcome.get("timeout"):
-            body = "Задача убита по таймауту. Полный лог в артефакте run.log.\n\n" + body
+            body = (
+                "The task was killed on timeout. The full log is in the run.log artifact.\n\n"
+                + body
+            )
         if outcome.get("errors"):
-            body += "\n\nСтроки ошибок из лога:\n" + "\n".join(outcome["errors"][:10])
+            body += "\n\nError lines from the log:\n" + "\n".join(outcome["errors"][:10])
         created = client.reply(message_id, body, result_meta)
         _relocate_artifacts(artifacts, str(created.get("id") or ""))
 

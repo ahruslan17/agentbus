@@ -17,12 +17,12 @@ def test_every_known_event_becomes_a_feed_row() -> None:
         line(
             type="text",
             timestamp=1001,
-            part={"text": "готово", "time": {"start": 1000, "end": 1001}},
+            part={"text": "done", "time": {"start": 1000, "end": 1001}},
         ),
         line(
             type="text",
             timestamp=1002,
-            part={"text": "ещё пишу", "time": {"start": 1002}},
+            part={"text": "still writing", "time": {"start": 1002}},
         ),
         line(
             type="tool_use",
@@ -73,9 +73,9 @@ def test_every_known_event_becomes_a_feed_row() -> None:
     assert [row["line"] for row in rows] == [2, 4, 5, 6, 7, 8, 9, 10]
 
     text = rows[0]
-    assert text["summary"] == "готово"
+    assert text["summary"] == "done"
     assert text["ts"] == 1001
-    assert text["detail"]["part"]["text"] == "готово"
+    assert text["detail"]["part"]["text"] == "done"
 
     shell, edit, custom = rows[1], rows[2], rows[3]
     assert (shell["tool"], shell["status"], shell["summary"]) == (

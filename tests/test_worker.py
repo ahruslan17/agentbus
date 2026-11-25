@@ -34,7 +34,7 @@ with journal.open("a", encoding="utf-8") as sink:
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0.5")))
 (cwd / "FAKE_OUTPUT").write_text("ok", encoding="utf-8")
 
-print(json.dumps({{"type": "text", "part": {{"time": {{"end": time.time()}}, "text": "готово"}}}}))
+print(json.dumps({{"type": "text", "part": {{"time": {{"end": time.time()}}, "text": "done"}}}}))
 print(json.dumps({{"type": "step_finish", "part": {{"cost": 0.0, "tokens": {{"input": 1, "output": 2}}}}}}))
 print("stdout:", " ".join(sys.argv[1:]))
 
@@ -112,7 +112,7 @@ def send(client: TestClient, **overrides) -> dict:
         "sender": "cage-claude",
         "recipient": "local-opencode",
         "kind": "task",
-        "body": "сделай дело",
+        "body": "do the work",
     }
     payload.update(overrides)
     response = client.post("/v1/messages", json=payload)
@@ -172,8 +172,8 @@ def test_two_slots_run_two_threads_of_one_repo_in_parallel(
 ) -> None:
     settings = worker_settings(tmp_path, repo, slots=2)
     stop = threading.Event()
-    first = send(client, repo=str(repo), body="первая")
-    second = send(client, repo=str(repo), body="вторая")
+    first = send(client, repo=str(repo), body="first")
+    second = send(client, repo=str(repo), body="second")
 
     threads = run_slots(settings, stop, http=client)
     try:
@@ -197,8 +197,8 @@ def test_two_slots_do_not_run_two_messages_of_one_thread(
 ) -> None:
     settings = worker_settings(tmp_path, repo, slots=2)
     stop = threading.Event()
-    task = send(client, repo=str(repo), body="работа")
-    note = send(client, kind="note", body="заметка", thread_id=task["thread_id"])
+    task = send(client, repo=str(repo), body="work")
+    note = send(client, kind="note", body="note", thread_id=task["thread_id"])
 
     threads = run_slots(settings, stop, http=client)
     try:
@@ -218,8 +218,8 @@ def test_one_slot_keeps_the_default_sequential_behaviour(
 ) -> None:
     settings = worker_settings(tmp_path, repo, slots=1)
     stop = threading.Event()
-    first = send(client, repo=str(repo), body="первая")
-    second = send(client, repo=str(repo), body="вторая")
+    first = send(client, repo=str(repo), body="first")
+    second = send(client, repo=str(repo), body="second")
 
     threads = run_slots(settings, stop, http=client)
     try:
@@ -240,7 +240,7 @@ def test_registry_shows_busy_slot_and_stops_both(
     monkeypatch.setenv("FAKE_SLEEP", "1")
     settings = worker_settings(tmp_path, repo, slots=2)
     stop = threading.Event()
-    task = send(client, repo=str(repo), body="работа")
+    task = send(client, repo=str(repo), body="work")
 
     threads = run_slots(settings, stop, http=client)
     try:
@@ -272,13 +272,13 @@ def test_stop_finishes_the_running_task_and_keeps_new_ones_queued(
     monkeypatch.setenv("FAKE_SLEEP", "0.8")
     settings = worker_settings(tmp_path, repo, slots=1)
     stop = threading.Event()
-    running = send(client, repo=str(repo), body="идёт")
+    running = send(client, repo=str(repo), body="running")
 
     threads = run_slots(settings, stop, http=client)
     try:
         wait_for_starts(tmp_path, 1)
         stop.set()
-        late = send(client, repo=str(repo), body="после стопа")
+        late = send(client, repo=str(repo), body="after stop")
     finally:
         stop.set()
         join_all(threads)
@@ -295,7 +295,7 @@ def test_lease_returned_while_stopping_goes_back_to_the_queue_at_once(
 ) -> None:
     settings = worker_settings(tmp_path, repo)
     stop = threading.Event()
-    task = send(client, repo=str(repo), body="работа")
+    task = send(client, repo=str(repo), body="work")
     original_lease = Client.lease
 
     def lease_then_stop(self, wait, owner=None):
@@ -375,7 +375,7 @@ def test_registry_failure_does_not_block_the_task(
 ) -> None:
     settings = worker_settings(tmp_path, repo)
     stop = threading.Event()
-    task = send(client, repo=str(repo), body="работа")
+    task = send(client, repo=str(repo), body="work")
 
     def broken_put(url: str, **_kwargs) -> httpx.Response:
         request = httpx.Request("PUT", f"http://testserver{url}")
@@ -523,7 +523,7 @@ def test_fix_in_same_thread_keeps_full_patch_and_separate_attempt_patch(
     stop = threading.Event()
     threads = run_slots(settings, stop, http=client)
     try:
-        first = send(client, repo=str(repo), body="первая")
+        first = send(client, repo=str(repo), body="first")
         wait_for_result(client, first)
         scripted_opencode(FAKE_FILES=json.dumps({"other.txt": "two\n"}))
         second = send(
@@ -531,7 +531,7 @@ def test_fix_in_same_thread_keeps_full_patch_and_separate_attempt_patch(
             kind="fix",
             repo=str(repo),
             thread_id=first["thread_id"],
-            body="доработка",
+            body="follow-up",
         )
         wait_for_result(client, second)
     finally:
@@ -662,7 +662,7 @@ def test_usage_sums_all_steps_and_counts_tool_calls(
 def test_run_log_shows_lines_while_opencode_is_running(
     tmp_path: Path, repo: Path, client: TestClient, scripted_opencode
 ) -> None:
-    line = json.dumps({"type": "text", "part": {"time": {"end": 1.0}, "text": "первая"}})
+    line = json.dumps({"type": "text", "part": {"time": {"end": 1.0}, "text": "first"}})
     scripted_opencode(
         FAKE_FIRST_LINES=line,
         FAKE_SLEEP="2",
@@ -670,7 +670,7 @@ def test_run_log_shows_lines_while_opencode_is_running(
     )
     settings = worker_settings(tmp_path, repo)
     stop = threading.Event()
-    message = send(client, repo=str(repo), body="долго")
+    message = send(client, repo=str(repo), body="slow")
     threads = run_slots(settings, stop, http=client)
     try:
         log_path = tmp_path / "state" / "artifacts" / message["id"] / "run.log"
@@ -696,7 +696,7 @@ def test_thread_without_base_file_falls_back_to_merge_base(
     scripted_opencode()
     settings = worker_settings(tmp_path, repo)
     base = git(repo, "rev-parse", "HEAD")
-    message = send(client, repo=str(repo), body="старый тред")
+    message = send(client, repo=str(repo), body="old thread")
 
     worktree = tmp_path / "state" / "worktrees" / message["thread_id"]
     worktree.parent.mkdir(parents=True, exist_ok=True)
