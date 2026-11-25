@@ -21,6 +21,15 @@ full event log (`events`) and the slot registry (`workers`) live in Postgres.
                                     └────────────────────────────────────────┘
 ```
 
+## Requirements
+
+- Linux host.
+- Python 3.12+ and `uv`.
+- Docker, for the Postgres container.
+- The OpenCode CLI on the host; the default model is set by `AGENTBUS_MODEL`.
+- `git`.
+- Inside the sandbox: only `python3`.
+
 ## Install
 
 ```bash
@@ -48,8 +57,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now agentbus-api agentbus-bridge agentbus-worker
 ```
 
-The units hard-code the checkout path in `ExecStart`; edit it if your clone lives
-elsewhere.
+The units assume the checkout is at `~/agentbus` (`%h/agentbus`); edit
+`ExecStart`/`WorkingDirectory` if yours lives elsewhere.
 
 Checks that do not call a model:
 
@@ -132,8 +141,8 @@ Two sessions in different products get separate mailboxes without configuration.
 mailbox (`outbox/ inbox/ sent/ read/`) and prints its path. `send`, `reply` and `init`
 create the folder themselves; other commands fail on a missing mailbox.
 
-Inside the sandbox you need only `bin/cb` and `python3` — no jq, no curl, no token:
-the bridge has no network access by design.
+Inside the sandbox you need only `bin/cb` and `python3`: the sandbox needs no network,
+no token and no API URL by design.
 
 ```bash
 export AGENTBUS_SHARE=/mnt/cage-bridge/cage-claude
@@ -221,9 +230,9 @@ cage run ~/agentbus/bin/cb inbox
 ```
 
 One caveat: Cage only exposes opened project directories. While another project is open,
-`~` is not visible in the VM — open it too, or add a line to `~/.agent-vm/volumes` (the
-native Cage mechanism: `source[:destination][:ro|rw[:project]]`), for example
-`~/path:rw`.
+the share directory is not visible in the VM — open it too, or add a line to
+`~/.agent-vm/volumes` (the native Cage mechanism:
+`source[:destination][:ro|rw[:project]]`), for example `/path/to/.agentbus:rw`.
 
 Another consequence: the token and `AGENTBUS_URL` never reach the sandbox. The only way
 to attack the bridge is to write files into the share, and the share is reachable only
