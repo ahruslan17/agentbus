@@ -205,3 +205,115 @@ def test_repo_outside_allowlist_skips_worktree(clean, repo, prune_settings, tmp_
 
     assert worktree.exists()
     assert any("outside AGENTBUS_REPOS" in warning for warning in plan.skipped)
+
+
+def make_dirty(worktree: Path, *, staged: bool = False) -> None:
+    path = worktree / "dirty.txt"
+    path.write_text("dirty\n", encoding="utf-8")
+    if staged:
+        git(worktree, "add", "dirty.txt")
+
+
+def add_detached_worktree(
+    repo: Path, settings: prune.PruneSettings, thread_id: str, *, commit_file: bool = False
+) -> Path:
+    path = settings.state_dir / "worktrees" / thread_id
+    path.parent.mkdir(parents=True, exist_ok=True)
+    git(repo, "worktree", "add", "-q", "--detach", str(path), "master")
+    if commit_file:
+        (path / f"{thread_id}.txt").write_text("x\n", encoding="utf-8")
+        commit(path, thread_id)
+    return path
+
+
+def test_uncommitted_worktree_kept(clean, repo, prune_settings):
+    with store.connect(TEST_URL) as conn:
+        thread_id, message_id = closed_thread(conn, repo)
+    worktree = add_worktree(repo, prune_settings, thread_id, commit_file=True)
+    make_dirty(worktree)
+    add_files(prune_settings, thread_id, message_id)
+
+    plan = prune.run(prune_settings, keep=0)
+
+    assert plan.failures == []
+    assert worktree.exists()
+    assert (worktree / "dirty.txt").is_file()
+    assert (prune_settings.artifacts_dir / message_id).is_dir()
+    assert (prune_settings.state_dir / "threads" / f"{thread_id}.json").is_file()
+    assert any("uncommitted changes: 1 files" in warning for warning in plan.skipped)
+    assert [path for path, _ in plan.dirty] == [worktree]
+
+
+def test_staged_worktree_kept(clean, repo, prune_settings):
+    with store.connect(TEST_URL) as conn:
+        thread_id, message_id = closed_thread(conn, repo)
+    worktree = add_worktree(repo, prune_settings, thread_id, commit_file=True)
+    make_dirty(worktree, staged=True)
+    add_files(prune_settings, thread_id, message_id)
+
+    plan = prune.run(prune_settings, keep=0)
+
+    assert plan.failures == []
+    assert worktree.exists()
+    assert (worktree / "dirty.txt").is_file()
+    assert (prune_settings.artifacts_dir / message_id).is_dir()
+    assert (prune_settings.state_dir / "threads" / f"{thread_id}.json").is_file()
+    assert any("uncommitted changes: 1 files" in warning for warning in plan.skipped)
+
+
+def test_only_ignored_files_pruned(clean, repo, prune_settings):
+    (repo / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    commit(repo, "ignore .venv")
+    with store.connect(TEST_URL) as conn:
+        thread_id, message_id = closed_thread(conn, repo)
+    worktree = add_worktree(repo, prune_settings, thread_id, commit_file=True)
+    ignored = worktree / ".venv"
+    ignored.mkdir()
+    (ignored / "state").write_text("x\n", encoding="utf-8")
+    add_files(prune_settings, thread_id, message_id)
+
+    plan = prune.run(prune_settings, keep=0)
+
+    assert plan.failures == []
+    assert not worktree.exists()
+    assert not (prune_settings.artifacts_dir / message_id).exists()
+    assert not (prune_settings.state_dir / "threads" / f"{thread_id}.json").exists()
+    assert plan.dirty == []
+
+
+def test_force_dirty_removes_uncommitted_worktree(clean, repo, prune_settings):
+    with store.connect(TEST_URL) as conn:
+        thread_id, message_id = closed_thread(conn, repo)
+    worktree = add_worktree(repo, prune_settings, thread_id, commit_file=True)
+    make_dirty(worktree)
+    add_files(prune_settings, thread_id, message_id)
+
+    plan = prune.run(prune_settings, keep=0, force_dirty=True)
+
+    assert plan.failures == []
+    assert not worktree.exists()
+    assert not (prune_settings.artifacts_dir / message_id).exists()
+    assert not (prune_settings.state_dir / "threads" / f"{thread_id}.json").exists()
+    assert plan.dirty == []
+
+
+def test_detached_head_kept_only_when_unmerged(clean, repo, prune_settings):
+    with store.connect(TEST_URL) as conn:
+        merged_id, merged_message = closed_thread(conn, repo, sender="smoke-a")
+        unmerged_id, unmerged_message = closed_thread(conn, repo, sender="smoke-b")
+    merged_worktree = add_detached_worktree(repo, prune_settings, merged_id)
+    unmerged_worktree = add_detached_worktree(repo, prune_settings, unmerged_id, commit_file=True)
+    add_files(prune_settings, merged_id, merged_message)
+    add_files(prune_settings, unmerged_id, unmerged_message)
+
+    plan = prune.run(prune_settings, keep=0)
+
+    assert plan.failures == []
+    assert not merged_worktree.exists()
+    assert not (prune_settings.artifacts_dir / merged_message).exists()
+    assert not (prune_settings.state_dir / "threads" / f"{merged_id}.json").exists()
+
+    assert unmerged_worktree.exists()
+    assert (prune_settings.artifacts_dir / unmerged_message).is_dir()
+    assert (prune_settings.state_dir / "threads" / f"{unmerged_id}.json").is_file()
+    assert any("detached HEAD with unmerged commits" in warning for warning in plan.skipped)
