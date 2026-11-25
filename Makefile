@@ -1,4 +1,7 @@
-.PHONY: check fmt test db-up db-down migrate api worker bridge smoke
+.PHONY: check fmt test db-up db-down migrate api worker bridge smoke smoke-pool prune
+
+KEEP ?= 50
+PRUNE_ARGS ?=
 
 check:
 	uv run ruff check src tests
@@ -32,3 +35,9 @@ bridge:
 
 smoke:
 	./tests/smoke.sh
+
+smoke-pool:
+	./tests/smoke_pool.sh
+
+prune:
+	uv run python -m agentbus.prune --keep $(KEEP) $(PRUNE_ARGS)

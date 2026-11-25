@@ -32,7 +32,7 @@ usage: ab <command> [options]
            [--thread ID] [--repo PATH] [--base REF] [--parent ID]
            [--meta JSON] [--key KEY] [--body-file FILE | BODY | stdin]
   wait     MESSAGE_ID [--timeout SECONDS] [--text]
-  lease    AGENT [--wait SECONDS] [--kinds a,b] [--text]
+  lease    AGENT [--wait SECONDS] [--kinds a,b] [--owner ID] [--text]
   reply    MESSAGE_ID [--kind result|verdict|ack] [--meta JSON] [--body-file FILE | BODY | stdin]
   state    MESSAGE_ID done|failed [--note TEXT]
   show     MESSAGE_ID [--text]
@@ -73,7 +73,7 @@ read_body() {
 from_flags() {
   FLAG_THREAD=""; FLAG_REPO=""; FLAG_BASE=""; FLAG_PARENT=""; FLAG_META="{}"
   FLAG_KEY=""; FLAG_KIND="task"; FLAG_TO=""; FLAG_TIMEOUT=1800; FLAG_TEXT=0
-  FLAG_KINDS=""; FLAG_NOTE=""; FLAG_WAIT=0; FLAG_BODY_FILE=""
+  FLAG_KINDS=""; FLAG_NOTE=""; FLAG_WAIT=0; FLAG_BODY_FILE=""; FLAG_OWNER=""
   local rest=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -90,6 +90,7 @@ from_flags() {
       --text) FLAG_TEXT=1; shift ;;
       --wait) FLAG_WAIT=$2; shift 2 ;;
       --kinds) FLAG_KINDS=$2; shift 2 ;;
+      --owner) FLAG_OWNER=$2; shift 2 ;;
       --note) FLAG_NOTE=$2; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) rest+=("$1"); shift ;;
@@ -153,6 +154,7 @@ cmd_lease() {
   local agent="${REST[0]:?AGENT is required}" wait="${FLAG_WAIT:-0}" out
   local query="?wait=$wait"
   [ -n "$FLAG_KINDS" ] && query="$query&kinds=$FLAG_KINDS"
+  [ -n "$FLAG_OWNER" ] && query="$query&owner=$(jq -rn --arg o "$FLAG_OWNER" '$o|@uri')"
   out=$(request POST "/v1/inbox/$agent/lease$query")
   if [ -z "$out" ]; then
     echo "no message" >&2
