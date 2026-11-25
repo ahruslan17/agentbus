@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from agentbus import live, runlog, store
+from agentbus.bridge import MAILBOX_NAME
 from agentbus.config import Settings
 
 MAX_FILE_BYTES = 256 * 1024
@@ -336,6 +337,15 @@ def create_app(
     def get_mailboxes() -> dict[str, Any]:
         with store.connect(current_settings().database_url) as conn:
             return {"mailboxes": store.mailboxes(conn)}
+
+    @app.get("/v1/mailboxes/{name}/status", dependencies=[guard])
+    def get_mailbox_status(
+        name: Annotated[str, PathParam(max_length=42, pattern=MAILBOX_NAME.pattern)],
+    ) -> dict[str, Any]:
+        with store.connect(current_settings().database_url) as conn:
+            return store.mailbox_status(
+                conn, name, lease_ttl_seconds=current_settings().lease_ttl_seconds
+            )
 
     @app.get("/v1/threads", dependencies=[guard])
     def get_threads(

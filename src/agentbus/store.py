@@ -493,9 +493,8 @@ def list_workers(conn: psycopg.Connection, *, lease_ttl_seconds: int) -> list[di
 # --- dashboard reads -------------------------------------------------------------
 
 
-def overview(conn: psycopg.Connection, *, lease_ttl_seconds: int) -> dict[str, Any]:
-    """Everything the "now" page needs: slots, queues and the last events."""
-    queues = conn.execute(
+def _queues(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
         """
         select recipient,
                count(*) filter (where state = 'queued') as queued,
@@ -506,6 +505,11 @@ def overview(conn: psycopg.Connection, *, lease_ttl_seconds: int) -> dict[str, A
          order by recipient
         """
     ).fetchall()
+
+
+def overview(conn: psycopg.Connection, *, lease_ttl_seconds: int) -> dict[str, Any]:
+    """Everything the "now" page needs: slots, queues and the last events."""
+    queues = _queues(conn)
     awaiting = conn.execute(
         """
         select recipient, count(*) as count
@@ -520,6 +524,110 @@ def overview(conn: psycopg.Connection, *, lease_ttl_seconds: int) -> dict[str, A
         "queues": queues,
         "awaiting_review": awaiting,
         "recent_events": recent_events(conn, limit=20),
+    }
+
+
+# Fields of a mailbox own message in `pending`; no body, so a status file written by
+# the bridge cannot leak message text. `result_id` is the answer to the message.
+_PENDING_FIELDS = """
+    m.id, m.thread_id, m.kind, m.meta->>'ticket' as ticket, m.state, m.attempt,
+    m.lease_owner, m.lease_until, m.created_at, m.updated_at,
+    (select r.id
+       from messages r
+      where r.kind = 'result' and r.parent_id = m.id
+      order by r.created_at, r.id
+      limit 1) as result_id
+"""
+
+
+def mailbox_status(
+    conn: psycopg.Connection, mailbox: str, *, lease_ttl_seconds: int
+) -> dict[str, Any]:
+    """What one mailbox may know about the queue: slots, queues, own messages, events.
+
+    A slot busy with a message of another mailbox exposes only that mailbox name:
+    no ticket, thread id or body of foreign work leaves the API through here.
+    """
+    workers = list_workers(conn, lease_ttl_seconds=lease_ttl_seconds)
+    busy_ids = [row["message_id"] for row in workers if row["message_id"]]
+    busy: dict[str, dict[str, Any]] = {}
+    if busy_ids:
+        rows = conn.execute(
+            "select id, sender, thread_id, meta->>'ticket' as ticket "
+            "  from messages where id = any(%s)",
+            (busy_ids,),
+        ).fetchall()
+        busy = {row["id"]: row for row in rows}
+
+    slots: list[dict[str, Any]] = []
+    for worker in workers:
+        slot = {
+            "id": worker["id"],
+            "state": worker["state"],
+            "model": worker["model"],
+            "harness": worker["harness"],
+            "heartbeat_at": worker["heartbeat_at"],
+            "stale": worker["stale"],
+            "message_id": worker["message_id"],
+        }
+        message = busy.get(worker["message_id"]) if worker["message_id"] else None
+        if message is not None:
+            if message["sender"] == mailbox:
+                slot["ticket"] = message["ticket"]
+                slot["thread_id"] = message["thread_id"]
+            else:
+                slot["sender"] = message["sender"]
+        slots.append(slot)
+
+    active = conn.execute(
+        f"""
+        select {_PENDING_FIELDS},
+               case when m.state = 'queued' then (
+                    select count(*) + 1
+                      from messages q
+                     where q.recipient = m.recipient
+                       and q.state = 'queued'
+                       and (q.created_at, q.id) < (m.created_at, m.id)
+               ) end as queue_position
+          from messages m
+         where m.sender = %s and m.state in ('queued', 'leased')
+         order by m.created_at, m.id
+        """,
+        (mailbox,),
+    ).fetchall()
+    finished = conn.execute(
+        f"""
+        select {_PENDING_FIELDS}, null::bigint as queue_position
+          from messages m
+         where m.sender = %s
+           and m.state in ('done', 'failed', 'cancelled')
+           and m.updated_at >= now() - interval '24 hours'
+         order by m.updated_at desc, m.id desc
+         limit 20
+        """,
+        (mailbox,),
+    ).fetchall()
+
+    events = conn.execute(
+        """
+        select e.id, e.at, e.message_id, e.thread_id, e.actor, e.kind, e.data
+          from events e
+         where e.thread_id in (
+               select distinct m.thread_id
+                 from messages m
+                where m.kind = 'task' and m.sender = %s and m.thread_id is not null)
+         order by e.id desc
+         limit 30
+        """,
+        (mailbox,),
+    ).fetchall()
+
+    return {
+        "workers": slots,
+        "queues": _queues(conn),
+        "pending": active + finished,
+        # Oldest first: the list reads like a journal and a consumer can print it.
+        "events": events[::-1],
     }
 
 
