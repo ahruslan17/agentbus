@@ -48,11 +48,22 @@ def test_app_exports_register_page(client: TestClient) -> None:
     assert "registerPage" in client.get("/ui/app.js").text
 
 
+STUB_TEXT = "скоро — T7"
+
+
 @pytest.mark.parametrize("page", PAGES[2:])
-def test_t7_pages_register_themselves(client: TestClient, page: str) -> None:
-    # T6 ships stubs («скоро — T7»); T7 only replaces the page bodies, so assert the
-    # registration contract rather than the temporary text.
-    assert "registerPage" in client.get(f"/ui/{page}").text
+def test_t7_pages_replace_the_stubs(client: TestClient, page: str) -> None:
+    # T6 shipped stubs («скоро — T7»); T7 replaces the bodies and keeps the
+    # registration contract.
+    text = client.get(f"/ui/{page}").text
+    assert "registerPage" in text
+    assert STUB_TEXT not in text
+
+
+@pytest.mark.parametrize("page", PAGES[2:])
+def test_t7_pages_build_dom_without_inner_html(client: TestClient, page: str) -> None:
+    # Data from the API must only reach the page as text nodes, never as markup.
+    assert "innerHTML" not in client.get(f"/ui/{page}").text
 
 
 def test_ui_does_not_load_anything_from_the_network(client: TestClient) -> None:
