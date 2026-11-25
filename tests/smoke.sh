@@ -10,7 +10,7 @@ export AGENTBUS_SELF="${AGENTBUS_SELF:-cage-claude}"
 ab health | jq -e '.ok' >/dev/null
 
 task=$(ab send --to local-opencode --repo "$PWD" --kind task --meta '{"acceptance":["smoke"]}' \
-  "smoke: ответь словом PONG")
+  "smoke: reply with the word PONG")
 task_id=$(jq -r '.id' <<<"$task")
 thread_id=$(jq -r '.thread_id' <<<"$task")
 echo "sent $task_id in $thread_id"

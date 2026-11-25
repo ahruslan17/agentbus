@@ -74,9 +74,9 @@ def test_outbox_file_becomes_a_message(client: TestClient, tmp_path: Path) -> No
         {
             "recipient": "local-opencode",
             "kind": "task",
-            "body": "сделай X",
+            "body": "do X",
             "repo": "/tmp/repo",
-            "meta": {"acceptance": ["X готов"]},
+            "meta": {"acceptance": ["X ready"]},
         },
     )
 
@@ -94,7 +94,7 @@ def test_outbox_file_becomes_a_message(client: TestClient, tmp_path: Path) -> No
     messages = client.get("/v1/inbox/local-opencode").json()["messages"]
     assert len(messages) == 1
     assert messages[0]["sender"] == "cage-claude"
-    assert messages[0]["meta"]["acceptance"] == ["X готов"]
+    assert messages[0]["meta"]["acceptance"] == ["X ready"]
 
 
 def test_outbox_is_idempotent_across_restarts(client: TestClient, tmp_path: Path) -> None:
@@ -133,13 +133,13 @@ def test_broken_files_are_rejected_not_retried(client: TestClient, tmp_path: Pat
 def test_replies_are_delivered_with_artifacts(
     client: TestClient, tmp_path: Path, artifacts: str
 ) -> None:
-    parent = send(client, body="сделай X")
+    parent = send(client, body="do X")
     reply = client.post(
         f"/v1/messages/{parent['id']}/reply",
         json={
             "sender": "local-opencode",
             "kind": "result",
-            "body": "готово",
+            "body": "done",
             "meta": {"artifacts": ["patch.diff"], "diff_stat": " 1 file changed"},
         },
     ).json()
@@ -155,7 +155,7 @@ def test_replies_are_delivered_with_artifacts(
     assert delivered == 1
     folder = share / "cage-claude" / "inbox" / reply["id"]
     envelope = json.loads((folder / "message.json").read_text(encoding="utf-8"))
-    assert envelope["body"] == "готово"
+    assert envelope["body"] == "done"
     assert envelope["parent_id"] == parent["id"]
     assert envelope["artifacts"] == ["patch.diff"]
     assert (folder / "patch.diff").read_text(encoding="utf-8").startswith("--- a")
@@ -176,7 +176,7 @@ def test_reply_from_the_vm_closes_the_task(client: TestClient, tmp_path: Path) -
         {
             "recipient": "local-opencode",
             "kind": "verdict",
-            "body": "правь Y",
+            "body": "edit Y",
             "thread_id": thread_id,
             "parent_id": parent["id"],
         },
@@ -187,7 +187,7 @@ def test_reply_from_the_vm_closes_the_task(client: TestClient, tmp_path: Path) -
     assert client.get(f"/v1/messages/{parent['id']}").json()["state"] == "done"
     verdict = client.post("/v1/inbox/local-opencode/lease").json()
     assert verdict["kind"] == "verdict"
-    assert verdict["body"] == "правь Y"
+    assert verdict["body"] == "edit Y"
 
 
 def test_lost_delivery_is_repeated(client: TestClient, tmp_path: Path) -> None:
@@ -239,7 +239,7 @@ def test_accept_decision_becomes_the_state_note(client: TestClient, tmp_path: Pa
     target.parent.mkdir(parents=True, exist_ok=True)
     (share / "cage-claude" / "inbox" / message["id"]).rename(target)
     (target / "decision.json").write_text(
-        json.dumps({"decision": "accept", "note": "всё ок"}, ensure_ascii=False),
+        json.dumps({"decision": "accept", "note": "all good"}, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -247,7 +247,8 @@ def test_accept_decision_becomes_the_state_note(client: TestClient, tmp_path: Pa
 
     assert acked == 1
     assert (
-        client.get(f"/v1/messages/{message['id']}").json()["meta"]["state_note"] == "accept: всё ок"
+        client.get(f"/v1/messages/{message['id']}").json()["meta"]["state_note"]
+        == "accept: all good"
     )
 
 
@@ -299,7 +300,7 @@ def test_two_mailboxes_send_and_receive_separately(client: TestClient, tmp_path:
     alpha_task = next(message for message in messages if message["sender"] == "alpha")
     reply = client.post(
         f"/v1/messages/{alpha_task['id']}/reply",
-        json={"sender": "local-opencode", "kind": "result", "body": "готово"},
+        json={"sender": "local-opencode", "kind": "result", "body": "done"},
     ).json()
 
     _, delivered, _ = bridge.run_once()
@@ -481,7 +482,7 @@ def test_status_file_carries_slots_queues_and_pending(client: TestClient, tmp_pa
         share,
         "alpha",
         "0001.json",
-        {"recipient": "local-opencode", "kind": "task", "body": "секретный текст"},
+        {"recipient": "local-opencode", "kind": "task", "body": "secret text"},
     )
     now = [1000.0]
     bridge = make_multi(client, share, tmp_path / "state", clock=lambda: now[0])
@@ -495,7 +496,7 @@ def test_status_file_carries_slots_queues_and_pending(client: TestClient, tmp_pa
     assert [row["recipient"] for row in payload["queues"]] == ["local-opencode"]
     assert [item["kind"] for item in payload["pending"]] == ["task"]
     text = path.read_text(encoding="utf-8")
-    assert "секретный текст" not in text
+    assert "secret text" not in text
     assert "test-token" not in text
 
 
@@ -520,7 +521,7 @@ def test_status_log_tail_is_the_text_of_the_last_lines(
                 {
                     "type": "text",
                     "timestamp": index,
-                    "part": {"text": f"строка {index}", "time": {"end": index}},
+                    "part": {"text": f"line {index}", "time": {"end": index}},
                 }
             )
             + "\n"
@@ -535,7 +536,7 @@ def test_status_log_tail_is_the_text_of_the_last_lines(
     payload = json.loads((share / "alpha" / "status.json").read_text(encoding="utf-8"))
     pending = {item["id"]: item for item in payload["pending"]}
     assert pending[task["id"]]["state"] == "leased"
-    assert pending[task["id"]]["log_tail"] == [f"строка {index}" for index in range(5, 20)]
+    assert pending[task["id"]]["log_tail"] == [f"line {index}" for index in range(5, 20)]
 
 
 def test_status_file_is_rewritten_once_per_interval(client: TestClient, tmp_path: Path) -> None:

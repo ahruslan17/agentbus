@@ -26,7 +26,7 @@ def send(client: TestClient, **overrides: Any) -> dict[str, Any]:
         "sender": "cage-claude",
         "recipient": "local-opencode",
         "kind": "task",
-        "body": "сделай дело",
+        "body": "do the work",
     }
     payload.update(overrides)
     response = client.post("/v1/messages", json=payload)
@@ -39,7 +39,7 @@ def create_message(**overrides: Any) -> dict[str, Any]:
         "sender": "cage-claude",
         "recipient": "local-opencode",
         "kind": "task",
-        "body": "сделай дело",
+        "body": "do the work",
     }
     payload.update(overrides)
     with store.connect(TEST_URL) as conn:
@@ -123,7 +123,7 @@ def test_two_subscribers_share_events_and_unsubscribe_is_isolated(clean: None) -
             hub.unsubscribe(first)
             assert hub.subscriber_count == 1
 
-            later = await asyncio.to_thread(create_message, body="второе дело")
+            later = await asyncio.to_thread(create_message, body="second job")
             payload = await _next(second)
             assert payload["message_id"] == later["id"]
             with pytest.raises(asyncio.QueueEmpty):
@@ -198,7 +198,7 @@ def test_stream_sends_hello_and_then_a_live_event(live_client: TestClient) -> No
 def test_last_event_id_replays_missed_events_without_duplicates(
     live_client: TestClient,
 ) -> None:
-    messages = [send(live_client, body=f"задача {number}") for number in range(3)]
+    messages = [send(live_client, body=f"task {number}") for number in range(3)]
     ids = [event["id"] for event in live_client.get("/v1/events").json()["events"]]
     assert len(ids) == 3
 

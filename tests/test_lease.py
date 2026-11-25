@@ -20,7 +20,7 @@ def send(client: TestClient, **overrides):
         "sender": "cage-claude",
         "recipient": "local-opencode",
         "kind": "task",
-        "body": "сделай дело",
+        "body": "do the work",
     }
     payload.update(overrides)
     response = client.post("/v1/messages", json=payload)
@@ -35,14 +35,14 @@ def lease(client: TestClient, **params):
 def reply(client: TestClient, message: dict) -> None:
     response = client.post(
         f"/v1/messages/{message['id']}/reply",
-        json={"sender": "local-opencode", "body": "готово"},
+        json={"sender": "local-opencode", "body": "done"},
     )
     assert response.status_code == 201, response.text
 
 
 def test_one_thread_is_leased_once_at_a_time(client: TestClient) -> None:
-    task = send(client, kind="task", body="работа")
-    note = send(client, kind="note", body="заметка", thread_id=task["thread_id"])
+    task = send(client, kind="task", body="work")
+    note = send(client, kind="note", body="note", thread_id=task["thread_id"])
 
     first = lease(client).json()
     assert first["id"] == task["id"]
@@ -55,8 +55,8 @@ def test_one_thread_is_leased_once_at_a_time(client: TestClient) -> None:
 
 
 def test_separate_threads_are_leased_back_to_back(client: TestClient) -> None:
-    first_sent = send(client, body="первый тред")
-    second_sent = send(client, body="второй тред")
+    first_sent = send(client, body="first thread")
+    second_sent = send(client, body="second thread")
 
     first = lease(client).json()
     second = lease(client).json()
@@ -82,8 +82,8 @@ def test_per_sender_limit_caps_one_sender(settings) -> None:
         create_app(replace(settings, per_sender_leases=1)),
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
-    first_sent = send(limited, body="первая")
-    second_sent = send(limited, body="вторая")
+    first_sent = send(limited, body="first")
+    second_sent = send(limited, body="second")
 
     first = lease(limited).json()
     assert first["id"] == first_sent["id"]
@@ -102,16 +102,16 @@ def test_owner_is_recorded_and_validated(client: TestClient) -> None:
     assert leased.status_code == 200
     assert leased.json()["lease_owner"] == "local-opencode#2"
 
-    assert lease(client, owner="плохой владелец").status_code == 422
+    assert lease(client, owner="bad owner").status_code == 422
     assert lease(client, owner="x" * 65).status_code == 422
 
 
 def test_concurrent_leases_never_hand_out_the_same_message(client: TestClient) -> None:
-    shared = send(client, kind="task", body="общий тред 1")
+    shared = send(client, kind="task", body="shared thread 1")
     for number in range(2, 5):
-        send(client, kind="note", body=f"общий тред {number}", thread_id=shared["thread_id"])
+        send(client, kind="note", body=f"shared thread {number}", thread_id=shared["thread_id"])
     for number in range(4):
-        send(client, body=f"свой тред {number}")
+        send(client, body=f"own thread {number}")
 
     barrier = threading.Barrier(8)
     results: list[dict | None] = []
@@ -137,8 +137,8 @@ def test_concurrent_leases_never_hand_out_the_same_message(client: TestClient) -
 
 
 def test_expired_lease_frees_the_thread(client: TestClient) -> None:
-    task = send(client, kind="task", body="работа")
-    send(client, kind="note", body="заметка", thread_id=task["thread_id"])
+    task = send(client, kind="task", body="work")
+    send(client, kind="note", body="note", thread_id=task["thread_id"])
 
     assert lease(client).json()["id"] == task["id"]
     assert lease(client).status_code == 204
@@ -156,7 +156,7 @@ def release(client: TestClient, message_id: str, owner: str):
 
 
 def test_release_by_its_owner_returns_the_message_to_the_queue(client: TestClient) -> None:
-    task = send(client, kind="task", body="работа")
+    task = send(client, kind="task", body="work")
     leased = lease(client, owner="local-opencode#2").json()
     assert leased["id"] == task["id"]
     assert leased["attempt"] == 1
@@ -202,5 +202,5 @@ def test_release_of_a_message_that_is_not_leased_is_rejected(client: TestClient)
 def test_release_validates_the_owner(client: TestClient) -> None:
     task = send(client)
 
-    assert release(client, task["id"], "плохой владелец").status_code == 422
+    assert release(client, task["id"], "bad owner").status_code == 422
     assert release(client, task["id"], "x" * 65).status_code == 422

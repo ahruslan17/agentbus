@@ -17,7 +17,7 @@ def send(client: TestClient, **overrides):
         "sender": "cage-claude",
         "recipient": "local-opencode",
         "kind": "task",
-        "body": "сделай дело",
+        "body": "do the work",
     }
     payload.update(overrides)
     response = client.post("/v1/messages", json=payload)
@@ -49,8 +49,8 @@ def test_idempotency_key_does_not_duplicate(client: TestClient) -> None:
 
 
 def test_lease_is_exclusive(client: TestClient) -> None:
-    a = send(client, body="первая")
-    b = send(client, body="вторая")
+    a = send(client, body="first")
+    b = send(client, body="second")
 
     first = client.post("/v1/inbox/local-opencode/lease").json()
     second = client.post("/v1/inbox/local-opencode/lease").json()
@@ -61,8 +61,8 @@ def test_lease_is_exclusive(client: TestClient) -> None:
 
 
 def test_lease_respects_kinds(client: TestClient) -> None:
-    note = send(client, kind="note", body="просто заметка")
-    task = send(client, kind="task", body="работа")
+    note = send(client, kind="note", body="just a note")
+    task = send(client, kind="task", body="work")
     leased = client.post("/v1/inbox/local-opencode/lease?kinds=task").json()
     assert leased["id"] == task["id"]
     assert client.get(f"/v1/messages/{note['id']}").json()["state"] == "queued"
@@ -76,7 +76,7 @@ def test_reply_closes_parent_and_returns_to_sender(client: TestClient) -> None:
         json={
             "sender": "local-opencode",
             "kind": "result",
-            "body": "готово",
+            "body": "done",
             "meta": {"branch": "agentbus/x", "session_id": "ses_1"},
         },
     ).json()

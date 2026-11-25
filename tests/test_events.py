@@ -19,7 +19,7 @@ def send(client: TestClient, **overrides):
         "sender": "cage-claude",
         "recipient": "local-opencode",
         "kind": "task",
-        "body": "сделай дело",
+        "body": "do the work",
     }
     payload.update(overrides)
     response = client.post("/v1/messages", json=payload)
@@ -34,7 +34,7 @@ def lease(client: TestClient, **params):
 def reply(client: TestClient, message: dict) -> None:
     response = client.post(
         f"/v1/messages/{message['id']}/reply",
-        json={"sender": "local-opencode", "body": "готово"},
+        json={"sender": "local-opencode", "body": "done"},
     )
     assert response.status_code == 201, response.text
 
@@ -189,8 +189,8 @@ def test_workers_list_marks_stale_heartbeat(client: TestClient) -> None:
 
 
 def test_events_after_cursor_returns_only_new_ascending(client: TestClient) -> None:
-    first = send(client, body="первое")
-    second = send(client, body="второе")
+    first = send(client, body="first")
+    second = send(client, body="second")
 
     all_events = client.get("/v1/events").json()["events"]
     assert {event["message_id"] for event in all_events} == {first["id"], second["id"]}
