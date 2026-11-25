@@ -48,6 +48,21 @@ def test_app_exports_register_page(client: TestClient) -> None:
     assert "registerPage" in client.get("/ui/app.js").text
 
 
+def test_app_router_supports_query(client: TestClient) -> None:
+    # T10: the router splits the hash into path and query, and pages update the
+    # query without a full re-render.
+    text = client.get("/ui/app.js").text
+    assert "setQuery" in text
+    assert "onQuery" in text
+
+
+@pytest.mark.parametrize("page", ("pages/history.js", "pages/stats.js"))
+def test_t7_pages_do_not_shim_the_hash(client: TestClient, page: str) -> None:
+    # T7 kept `?query` out of the hash with `replaceState` while the router
+    # matched the whole hash; the shim must be gone now.
+    assert "replaceState" not in client.get(f"/ui/{page}").text
+
+
 STUB_TEXT = "скоро — T7"
 
 

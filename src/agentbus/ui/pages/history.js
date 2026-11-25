@@ -1,6 +1,5 @@
 import { errorNote, h, isAbort, registerPage } from "../app.js";
 
-const ROUTE = "/history";
 const PAGE_SIZE = 50;
 const DEBOUNCE_MS = 300;
 const STYLE_ID = "t7-history-style";
@@ -71,62 +70,22 @@ const STYLE = `
 .t7-more[hidden] { display: none; }
 `;
 
-let hashQuery = "";
-let restoreTimer = null;
-
-// `app.js` matches routes against the whole hash, so a query string there would
-// render "not found". Keep the query out of the hash while the router renders,
-// then put it back so a filtered page stays a shareable link.
-adoptHash();
-window.addEventListener("hashchange", adoptHash);
-
 registerPage("history", { title: "История", render });
 
-function adoptHash() {
-  const raw = location.hash.replace(/^#/, "");
-  if (raw === ROUTE) {
-    hashQuery = "";
-    return;
-  }
-  if (!raw.startsWith(`${ROUTE}?`)) return;
-  hashQuery = raw.slice(ROUTE.length + 1);
-  history.replaceState(null, "", `#${ROUTE}`);
-  if (restoreTimer) clearTimeout(restoreTimer);
-  restoreTimer = setTimeout(restoreHash, 0);
-}
-
-function restoreHash() {
-  restoreTimer = null;
-  if (location.hash !== `#${ROUTE}`) return;
-  history.replaceState(null, "", `#${ROUTE}?${hashQuery}`);
-}
-
-function currentQuery() {
-  if (hashQuery) return hashQuery;
-  const index = location.hash.indexOf("?");
-  return index >= 0 ? location.hash.slice(index + 1) : "";
-}
-
-function readFilters() {
-  const params = new URLSearchParams(currentQuery());
+function readFilters(query) {
   const filters = {};
-  for (const key of FILTER_KEYS) filters[key] = params.get(key) || "";
+  for (const key of FILTER_KEYS) {
+    const value = query ? query[key] : "";
+    filters[key] = typeof value === "string" ? value : "";
+  }
   if (!STATES.some(([value]) => value === filters.state)) filters.state = "";
   return filters;
 }
 
-function buildQuery(filters) {
-  const params = new URLSearchParams();
-  for (const key of FILTER_KEYS) {
-    if (filters[key]) params.set(key, filters[key]);
-  }
-  return params.toString();
-}
-
-function render(root, _params, ctx) {
+function render(root, params, ctx) {
   ensureStyles();
 
-  const filters = readFilters();
+  const filters = readFilters(params.query);
   const knownRepos = new Set(filters.repo ? [filters.repo] : []);
   const state = { rows: [], seq: 0 };
 
@@ -266,12 +225,28 @@ function render(root, _params, ctx) {
     filters.repo = repoSelect.value;
     filters.state = stateSelect.value;
     filters.q = search.value.trim();
-    const query = buildQuery(filters);
-    if (query !== currentQuery()) {
-      hashQuery = query;
-      history.pushState(null, "", `#${ROUTE}${query ? `?${query}` : ""}`);
+    ctx.setQuery(filters);
+  }
+
+  // `ctx.setQuery` and Back/forward both land here. The page is not re-rendered,
+  // so the search field keeps focus; only the data is reloaded.
+  function applyQuery(query) {
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
     }
+    Object.assign(filters, readFilters(query));
+    syncControls();
     load(true);
+  }
+
+  function syncControls() {
+    ensureOption(mailboxSelect, filters.mailbox);
+    ensureOption(repoSelect, filters.repo);
+    mailboxSelect.value = filters.mailbox;
+    repoSelect.value = filters.repo;
+    stateSelect.value = filters.state;
+    if (search.value !== filters.q) search.value = filters.q;
   }
 
   function onSearch() {
@@ -297,6 +272,7 @@ function render(root, _params, ctx) {
   stateSelect.addEventListener("change", applyFilters);
   search.addEventListener("input", onSearch);
   more.addEventListener("click", () => load(false));
+  ctx.onQuery(applyQuery);
 
   fillSelect(mailboxSelect, [], filters.mailbox, "все ящики");
   fillSelect(repoSelect, [...knownRepos], filters.repo, "все репозитории");
@@ -322,6 +298,13 @@ function fillSelect(select, values, selected, allLabel) {
     ...options.map((value) => h("option", { value }, value)),
   );
   select.value = selected || "";
+}
+
+// A value restored from the hash by Back/forward may not be in the list yet.
+function ensureOption(select, value) {
+  if (!value) return;
+  if ([...select.options].some((option) => option.value === value)) return;
+  select.append(h("option", { value }, value));
 }
 
 function bindOpen(node, href) {

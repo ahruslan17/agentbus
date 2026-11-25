@@ -25,6 +25,8 @@ let rootEl = null;
 let abortController = null;
 let unmountFns = [];
 let unsubscribeFns = [];
+let queryListeners = [];
+let activeRoute = null;
 let authScreenShown = false;
 
 class AuthError extends Error {}
@@ -99,7 +101,7 @@ export function fmtTokens(value) {
 function start() {
   rootEl = document.getElementById("app");
   if (!rootEl) return;
-  window.addEventListener("hashchange", show);
+  window.addEventListener("hashchange", onHashChange);
   show();
 }
 
@@ -119,6 +121,7 @@ function show() {
   const match = matchRoute(location.hash);
   markNav(match);
   if (!match) {
+    activeRoute = null;
     rootEl.replaceChildren(
       h(
         "section",
@@ -130,6 +133,7 @@ function show() {
     );
     return;
   }
+  activeRoute = { name: match.name, path: match.path };
   const page = pages.get(match.name);
   const view = h("section", { class: `page page-${match.name}` });
   rootEl.replaceChildren(view);
@@ -152,13 +156,80 @@ function show() {
   }
 }
 
+/**
+ * Hash is split into a path that matches the routes and a query string that the
+ * page reads: `#/history?mailbox=a` → path `/history`, query `mailbox=a`.
+ */
+function splitHash(hash) {
+  const raw = (hash || "").replace(/^#/, "");
+  const index = raw.indexOf("?");
+  if (index < 0) return { path: raw, search: "" };
+  return { path: raw.slice(0, index), search: raw.slice(index + 1) };
+}
+
+function parseQuery(search) {
+  const query = {};
+  for (const [key, value] of new URLSearchParams(search)) {
+    // `URLSearchParams.get` returns the first value; keep the same rule here.
+    if (!(key in query)) query[key] = value;
+  }
+  return query;
+}
+
 function matchRoute(hash) {
-  const path = (hash || "").replace(/^#/, "") || "/now";
+  const { path: rawPath, search } = splitHash(hash);
+  const path = rawPath || "/now";
   for (const [name, pattern] of routes) {
     const found = path.match(pattern);
-    if (found) return { name, params: { id: decodePart(found[1] || "") } };
+    if (found) {
+      const id = decodePart(found[1] || "");
+      return { name, path, params: { id, query: parseQuery(search) } };
+    }
   }
   return null;
+}
+
+// Back/forward between two hashes that differ only in their query update the
+// page through `onQuery` instead of throwing the DOM away and rendering again.
+function onHashChange() {
+  if (!rootEl) return;
+  const match = matchRoute(location.hash);
+  if (match && activeRoute && match.name === activeRoute.name && match.path === activeRoute.path) {
+    emitQuery(match.params.query);
+    return;
+  }
+  show();
+}
+
+function emitQuery(query) {
+  for (const listener of [...queryListeners]) {
+    try {
+      listener(query);
+    } catch (error) {
+      console.error(error);
+    }
+  }
+}
+
+/**
+ * Rewrites the query of the current route without re-rendering the page, then
+ * notifies `onQuery` subscribers. Empty values drop their key.
+ */
+function setQuery(update = {}, { replace = false } = {}) {
+  if (!activeRoute) return;
+  const current = matchRoute(location.hash);
+  const merged = { ...(current ? current.params.query : {}), ...update };
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(merged)) {
+    if (value === null || value === undefined || value === "") continue;
+    params.set(key, String(value));
+  }
+  const search = params.toString();
+  const hash = `#${activeRoute.path}${search ? `?${search}` : ""}`;
+  if (hash === location.hash) return;
+  if (replace) history.replaceState(null, "", hash);
+  else history.pushState(null, "", hash);
+  emitQuery(parseQuery(search));
 }
 
 function decodePart(value) {
@@ -191,6 +262,8 @@ function teardown() {
       console.error(error);
     }
   }
+  queryListeners = [];
+  activeRoute = null;
   if (abortController) {
     abortController.abort();
     abortController = null;
@@ -201,6 +274,13 @@ function context(controller) {
   return {
     api: (path, options = {}) => request(path, { ...options, signal: controller.signal }),
     link: (path) => `#${path}`,
+    setQuery,
+    onQuery: (listener) => {
+      queryListeners.push(listener);
+      return () => {
+        queryListeners = queryListeners.filter((fn) => fn !== listener);
+      };
+    },
     onLive: (listener) => {
       const off = live.subscribe(listener);
       unsubscribeFns.push(off);
