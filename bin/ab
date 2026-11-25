@@ -5,7 +5,7 @@
 #   export AGENTBUS_TOKEN=...
 #   export AGENTBUS_URL=http://host:8787  # UI default: localhost
 #
-#   ab send --to local-opencode --repo ~/personal/real-inflation --kind task "сделай T1"
+#   ab send --to local-opencode --repo /path/to/repo --kind task "do T1"
 #   ab wait <message_id> --text
 #   ab lease cage-claude --wait 60
 #   ab reply <message_id> --kind verdict --body-file review.md

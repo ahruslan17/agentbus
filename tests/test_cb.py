@@ -222,7 +222,7 @@ def test_send_prints_id_from_receipt(tmp_path: Path) -> None:
     )
 
     result = run_cb(
-        ["send", "--to", "local-opencode", "--wait-id", "10", "сделай X"],
+        ["send", "--to", "local-opencode", "--wait-id", "10", "do X"],
         env={"AGENTBUS_SHARE": str(box)},
     )
     writer.join(timeout=15)
@@ -238,7 +238,7 @@ def test_send_without_receipt_warns_but_succeeds(tmp_path: Path) -> None:
     box = make_mailbox(tmp_path / "box")
 
     result = run_cb(
-        ["send", "--to", "local-opencode", "--wait-id", "1", "сделай X"],
+        ["send", "--to", "local-opencode", "--wait-id", "1", "do X"],
         env={"AGENTBUS_SHARE": str(box)},
     )
 
@@ -254,7 +254,7 @@ def test_send_reports_a_failed_file(tmp_path: Path) -> None:
     writer = failure_writer(box, delay=1.0, error="422: unknown recipient local-opencode")
 
     result = run_cb(
-        ["send", "--to", "local-opencode", "--wait-id", "10", "сделай X"],
+        ["send", "--to", "local-opencode", "--wait-id", "10", "do X"],
         env={"AGENTBUS_SHARE": str(box)},
     )
     writer.join(timeout=15)
@@ -345,7 +345,7 @@ def ticket_chain(mailbox: Path) -> None:
         {
             "recipient": "local-opencode",
             "kind": "task",
-            "body": "сделай X",
+            "body": "do X",
             "meta": {"ticket": "T2.1"},
         },
     )
@@ -364,7 +364,7 @@ def ticket_chain(mailbox: Path) -> None:
         {
             "recipient": "local-opencode",
             "kind": "verdict",
-            "body": "правь Y",
+            "body": "fix Y",
             "parent_id": "m_result",
             "meta": {"ticket": "T2.1", "decision": "rework"},
         },
@@ -388,7 +388,7 @@ def test_inbox_shows_ticket_through_receipts(tmp_path: Path) -> None:
     result = run_cb(["inbox"], env={"AGENTBUS_SHARE": str(box)})
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("тикет T2.1") == 2
+    assert result.stdout.count("ticket T2.1") == 2
     assert "m_result" in result.stdout
     assert "m_fix" in result.stdout
 
@@ -400,7 +400,7 @@ def test_show_text_prints_ticket(tmp_path: Path) -> None:
     result = run_cb(["show", "m_fix", "--text"], env={"AGENTBUS_SHARE": str(box)})
 
     assert result.returncode == 0, result.stderr
-    assert "тикет T2.1" in result.stdout
+    assert "ticket T2.1" in result.stdout
 
 
 def test_reply_verdict_gets_rework_and_inherits_ticket(tmp_path: Path) -> None:
@@ -417,7 +417,7 @@ def test_reply_verdict_gets_rework_and_inherits_ticket(tmp_path: Path) -> None:
     )
 
     result = run_cb(
-        ["reply", "m_result", "--kind", "verdict", "--wait-id", "0", "правь Y"],
+        ["reply", "m_result", "--kind", "verdict", "--wait-id", "0", "fix Y"],
         env={"AGENTBUS_SHARE": str(box)},
     )
 
@@ -449,7 +449,7 @@ def test_explicit_decision_is_not_overwritten(tmp_path: Path) -> None:
             "0",
             "--meta",
             '{"decision": "accept"}',
-            "годится",
+            "looks good",
         ],
         env={"AGENTBUS_SHARE": str(box)},
     )
@@ -468,12 +468,12 @@ def test_accept_writes_decision_and_moves_to_read(tmp_path: Path) -> None:
         {"id": "m_result", "parent_id": "m_task", "kind": "result", "meta": {}},
     )
 
-    result = run_cb(["accept", "m_result", "--note", "всё ок"], env={"AGENTBUS_SHARE": str(box)})
+    result = run_cb(["accept", "m_result", "--note", "all good"], env={"AGENTBUS_SHARE": str(box)})
 
     assert result.returncode == 0, result.stderr
     assert not (box / "inbox" / "m_result").exists()
     decision = json.loads((box / "read" / "m_result" / "decision.json").read_text(encoding="utf-8"))
-    assert decision == {"decision": "accept", "note": "всё ок"}
+    assert decision == {"decision": "accept", "note": "all good"}
     assert (box / "read" / "m_result" / "message.json").is_file()
 
 
