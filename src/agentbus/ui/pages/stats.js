@@ -2,31 +2,31 @@ import { errorNote, fmtDuration, fmtTokens, h, isAbort, registerPage } from "../
 
 const STYLE_ID = "t7-stats-style";
 const GROUPS = [
-  ["mailbox", "ящик"],
-  ["repo", "репозиторий"],
-  ["model", "модель"],
+  ["mailbox", "mailbox"],
+  ["repo", "repo"],
+  ["model", "model"],
 ];
 const ACCEPT_TITLE =
-  "Треды, где первый результат принят (state_note accept*), и их доля от тикетов группы";
+  "Threads whose first result was accepted (state_note accept*) and their share of the group's tickets";
 const COLUMNS = [
-  { label: "Группа" },
-  { label: "Тикетов", num: true, title: "Сколько тредов с задачей в группе" },
-  { label: "Результатов", num: true, title: "Сообщений kind=result" },
-  { label: "Принято с первого ревью", num: true, title: ACCEPT_TITLE },
-  { label: "Rework", num: true, title: "Вердикты с решением rework" },
-  { label: "Таймаутов", num: true, title: "Результаты с meta.timeout=true" },
-  { label: "Сбоев", num: true, title: "Треды, где есть сообщение в состоянии failed" },
+  { label: "Group" },
+  { label: "Tickets", num: true, title: "Threads with a task in the group" },
+  { label: "Results", num: true, title: "Messages with kind=result" },
+  { label: "Accepted first review", num: true, title: ACCEPT_TITLE },
+  { label: "Rework", num: true, title: "Verdicts with decision rework" },
+  { label: "Timeouts", num: true, title: "Results with meta.timeout=true" },
+  { label: "Failed", num: true, title: "Threads with a message in the failed state" },
   {
-    label: "Очередь, медиана",
+    label: "Queue median",
     num: true,
-    title: "Медиана от создания задачи до её lease, секунды",
+    title: "Median time from task creation to its lease, seconds",
   },
   {
-    label: "Исполнение, медиана",
+    label: "Run median",
     num: true,
-    title: "Медиана от lease родителя до создания результата, секунды",
+    title: "Median time from the parent lease to result creation, seconds",
   },
-  { label: "Токены in / out", num: true, title: "Сумма usage.tokens.input / output по результатам" },
+  { label: "Tokens in / out", num: true, title: "Sum of usage.tokens.input / output across results" },
 ];
 
 const STYLE = `
@@ -95,7 +95,7 @@ const STYLE = `
 .t7-table-wrap[hidden] { display: none; }
 `;
 
-registerPage("stats", { title: "Статистика", render });
+registerPage("stats", { title: "Stats", render });
 
 function readGroup(query) {
   const group = query ? query.group : "";
@@ -109,7 +109,7 @@ function render(root, params, ctx) {
   let requestSeq = 0;
 
   const status = h("div", { class: "status muted" });
-  const switcher = h("div", { class: "t7-groups", role: "group", "aria-label": "Группировка" });
+  const switcher = h("div", { class: "t7-groups", role: "group", "aria-label": "Grouping" });
   const buttons = new Map();
   for (const [value, label] of GROUPS) {
     const button = h("button", { type: "button", class: "t7-group" }, label);
@@ -118,7 +118,7 @@ function render(root, params, ctx) {
     switcher.append(button);
   }
 
-  const empty = h("p", { class: "muted" }, "данных пока нет");
+  const empty = h("p", { class: "muted" }, "no data yet");
   const acceptBars = h("div");
   const runBars = h("div");
   const bars = h(
@@ -127,7 +127,7 @@ function render(root, params, ctx) {
     h(
       "section",
       { class: "t7-bar-block" },
-      h("h2", { title: ACCEPT_TITLE }, "принято с первого ревью, %"),
+      h("h2", { title: ACCEPT_TITLE }, "accepted on first review, %"),
       acceptBars,
     ),
     h(
@@ -135,8 +135,8 @@ function render(root, params, ctx) {
       { class: "t7-bar-block" },
       h(
         "h2",
-        { title: "Доля от максимальной медианы исполнения в таблице" },
-        "медиана исполнения",
+        { title: "Share of the highest run median in the table" },
+        "run median",
       ),
       runBars,
     ),
@@ -171,13 +171,13 @@ function render(root, params, ctx) {
   empty.hidden = true;
   bars.hidden = true;
   table.hidden = true;
-  root.replaceChildren(h("h1", {}, "Статистика"), status, switcher, bars, empty, table);
+  root.replaceChildren(h("h1", {}, "Stats"), status, switcher, bars, empty, table);
 
   syncButtons();
 
   async function load() {
     const seq = ++requestSeq;
-    status.textContent = "загрузка…";
+    status.textContent = "loading…";
     try {
       const data = await ctx.api(`/v1/stats?group=${encodeURIComponent(group)}`);
       if (seq !== requestSeq) return;
@@ -313,7 +313,7 @@ function formatCount(value) {
   if (value === null || value === undefined) return "—";
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
-  return number.toLocaleString("ru-RU");
+  return number.toLocaleString("en-US");
 }
 
 function ensureStyles() {

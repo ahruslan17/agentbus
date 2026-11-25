@@ -12,30 +12,30 @@ const LIVE_THROTTLE_MS = 1000;
 const TAIL_MS = 2000;
 const TAIL_LINES = 3;
 
-registerPage("now", { title: "Сейчас", render });
+registerPage("now", { title: "Now", render });
 
 function render(root, _params, ctx) {
   const slots = h("div", { class: "slots" });
-  const slotsEmpty = h("p", { class: "muted" }, "слотов нет: worker не запущен");
+  const slotsEmpty = h("p", { class: "muted" }, "no slots: worker is not running");
   const queues = h("div", { class: "panel-list" });
   const review = h("div", { class: "panel-list" });
   const events = h("div", { class: "panel-list" });
   const status = h("div", { class: "status muted" });
 
   root.replaceChildren(
-    h("h1", {}, "Сейчас"),
+    h("h1", {}, "Now"),
     status,
-    block("Слоты", slots, slotsEmpty),
+    block("Slots", slots, slotsEmpty),
     block(
-      "Очереди",
+      "Queues",
       h(
         "div",
         { class: "cols" },
-        column("По получателям", queues),
-        column("Ждут ревью", review),
+        column("By recipient", queues),
+        column("Awaiting review", review),
       ),
     ),
-    block("Последние события", events),
+    block("Recent events", events),
   );
 
   const state = {
@@ -73,8 +73,8 @@ function render(root, _params, ctx) {
     const workers = Array.isArray(data.workers) ? data.workers : [];
     applyWorkers(workers);
     slotsEmpty.hidden = workers.length > 0;
-    renderQueues(queues, data.queues, (row) => `${row.queued} в очереди · ${row.leased} в работе`);
-    renderQueues(review, data.awaiting_review, (row) => `ждут ревью: ${row.count}`);
+    renderQueues(queues, data.queues, (row) => `${row.queued} queued · ${row.leased} in progress`);
+    renderQueues(review, data.awaiting_review, (row) => `awaiting review: ${row.count}`);
     renderEvents(events, data.recent_events);
     tickAll();
   }
@@ -153,7 +153,7 @@ function render(root, _params, ctx) {
     if (card.timer) clearInterval(card.timer);
     card.timer = null;
     if (!messageId) {
-      card.task.textContent = card.busy ? "задача…" : "свободен";
+      card.task.textContent = card.busy ? "task…" : "idle";
       return;
     }
     card.task.append(h("span", { class: "mono" }, messageId));
@@ -167,7 +167,7 @@ function render(root, _params, ctx) {
     try {
       message = await ctx.api(`/v1/messages/${encodeURIComponent(messageId)}`);
     } catch (error) {
-      if (!isAbort(error)) card.task.append(h("span", { class: "muted" }, ` (детали: ${error.message})`));
+      if (!isAbort(error)) card.task.append(h("span", { class: "muted" }, ` (details: ${error.message})`));
       return;
     }
     if (card.messageId !== messageId) return;
@@ -194,7 +194,7 @@ function render(root, _params, ctx) {
       tickCard(card);
     } catch (error) {
       if (isAbort(error)) return;
-      // без времени lease просто покажем «идёт»
+      // without a lease timestamp we just show "running"
     }
   }
 
@@ -217,7 +217,7 @@ function render(root, _params, ctx) {
       }
     } catch (error) {
       if (isAbort(error)) return;
-      card.tail.textContent = `лог недоступен: ${error.message}`;
+      card.tail.textContent = `log unavailable: ${error.message}`;
     }
   }
 
@@ -233,8 +233,8 @@ function render(root, _params, ctx) {
       return;
     }
     card.timing.textContent = card.leasedAt
-      ? `идёт ${fmtDuration((Date.now() - card.leasedAt) / 1000)}`
-      : "идёт";
+      ? `running for ${fmtDuration((Date.now() - card.leasedAt) / 1000)}`
+      : "running";
   }
 
   function tickAll() {
@@ -281,7 +281,7 @@ function tailLine(row) {
 
 function renderQueues(container, rows, label) {
   if (!Array.isArray(rows) || !rows.length) {
-    container.replaceChildren(h("p", { class: "muted" }, "пусто"));
+    container.replaceChildren(h("p", { class: "muted" }, "empty"));
     return;
   }
   container.replaceChildren(
@@ -298,7 +298,7 @@ function renderQueues(container, rows, label) {
 
 function renderEvents(container, rows) {
   if (!Array.isArray(rows) || !rows.length) {
-    container.replaceChildren(h("p", { class: "muted" }, "событий пока нет"));
+    container.replaceChildren(h("p", { class: "muted" }, "no events yet"));
     return;
   }
   container.replaceChildren(

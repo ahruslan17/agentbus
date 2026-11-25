@@ -5,21 +5,21 @@ const DEBOUNCE_MS = 300;
 const STYLE_ID = "t7-history-style";
 const FILTER_KEYS = ["mailbox", "repo", "state", "q"];
 const STATES = [
-  ["", "все"],
-  ["active", "в работе"],
-  ["review", "ждут ревью"],
-  ["done", "готово"],
-  ["failed", "сбои"],
+  ["", "all"],
+  ["active", "in progress"],
+  ["review", "awaiting review"],
+  ["done", "done"],
+  ["failed", "failed"],
 ];
 const COLUMNS = [
-  { label: "Тикет" },
-  { label: "Заголовок" },
-  { label: "Репозиторий" },
-  { label: "Ящик" },
-  { label: "Попыток", num: true },
-  { label: "Последний" },
-  { label: "Модель" },
-  { label: "Обновлён" },
+  { label: "Ticket" },
+  { label: "Title" },
+  { label: "Repo" },
+  { label: "Mailbox" },
+  { label: "Attempts", num: true },
+  { label: "Last" },
+  { label: "Model" },
+  { label: "Updated" },
 ];
 
 const STYLE = `
@@ -70,7 +70,7 @@ const STYLE = `
 .t7-more[hidden] { display: none; }
 `;
 
-registerPage("history", { title: "История", render });
+registerPage("history", { title: "History", render });
 
 function readFilters(query) {
   const filters = {};
@@ -100,7 +100,7 @@ function render(root, params, ctx) {
   const search = h("input", {
     type: "search",
     name: "q",
-    placeholder: "поиск по тексту",
+    placeholder: "search text",
     value: filters.q,
     autocomplete: "off",
   });
@@ -108,15 +108,15 @@ function render(root, params, ctx) {
   const form = h(
     "form",
     { class: "t7-filters" },
-    field("ящик", mailboxSelect),
-    field("репозиторий", repoSelect),
-    field("состояние", stateSelect),
-    field("поиск", search),
+    field("mailbox", mailboxSelect),
+    field("repository", repoSelect),
+    field("state", stateSelect),
+    field("search", search),
   );
   form.addEventListener("submit", (event) => event.preventDefault());
 
   const status = h("div", { class: "status muted" });
-  const empty = h("p", { class: "muted" }, "тредов не найдено");
+  const empty = h("p", { class: "muted" }, "no threads found");
   const body = h("tbody");
   const table = h(
     "div",
@@ -138,19 +138,19 @@ function render(root, params, ctx) {
       body,
     ),
   );
-  const more = h("button", { type: "button", class: "t7-more" }, "показать ещё");
+  const more = h("button", { type: "button", class: "t7-more" }, "show more");
   const footer = h("div", { class: "t7-footer" }, more);
 
   empty.hidden = true;
   table.hidden = true;
   more.hidden = true;
-  root.replaceChildren(h("h1", {}, "История"), status, form, empty, table, footer);
+  root.replaceChildren(h("h1", {}, "History"), status, form, empty, table, footer);
 
   let searchTimer = null;
 
   async function load(reset) {
     const seq = ++state.seq;
-    if (reset) status.textContent = "загрузка…";
+    if (reset) status.textContent = "loading…";
     try {
       const data = await ctx.api(`/v1/threads?${requestQuery(reset ? 0 : state.rows.length)}`);
       if (seq !== state.seq) return;
@@ -189,7 +189,7 @@ function render(root, params, ctx) {
       knownRepos.add(row.repo);
       changed = true;
     }
-    if (changed) fillSelect(repoSelect, [...knownRepos], filters.repo, "все репозитории");
+    if (changed) fillSelect(repoSelect, [...knownRepos], filters.repo, "all repos");
   }
 
   function rowNode(row) {
@@ -260,10 +260,10 @@ function render(root, params, ctx) {
       const names = (Array.isArray(data.mailboxes) ? data.mailboxes : []).map(
         (row) => row.mailbox,
       );
-      fillSelect(mailboxSelect, names, filters.mailbox, "все ящики");
+      fillSelect(mailboxSelect, names, filters.mailbox, "all mailboxes");
     } catch (error) {
       if (isAbort(error)) return;
-      fillSelect(mailboxSelect, [], filters.mailbox, "все ящики");
+      fillSelect(mailboxSelect, [], filters.mailbox, "all mailboxes");
     }
   }
 
@@ -274,8 +274,8 @@ function render(root, params, ctx) {
   more.addEventListener("click", () => load(false));
   ctx.onQuery(applyQuery);
 
-  fillSelect(mailboxSelect, [], filters.mailbox, "все ящики");
-  fillSelect(repoSelect, [...knownRepos], filters.repo, "все репозитории");
+  fillSelect(mailboxSelect, [], filters.mailbox, "all mailboxes");
+  fillSelect(repoSelect, [...knownRepos], filters.repo, "all repos");
   loadMailboxes();
   load(true);
 
@@ -290,7 +290,7 @@ function field(label, control) {
 
 function fillSelect(select, values, selected, allLabel) {
   const options = [...new Set(values.filter(Boolean))].sort((left, right) =>
-    left.localeCompare(right, "ru"),
+    left.localeCompare(right, "en"),
   );
   if (selected && !options.includes(selected)) options.push(selected);
   select.replaceChildren(
@@ -338,7 +338,7 @@ function formatCount(value) {
   if (value === null || value === undefined) return "—";
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
-  return number.toLocaleString("ru-RU");
+  return number.toLocaleString("en-US");
 }
 
 function ensureStyles() {

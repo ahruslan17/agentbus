@@ -62,7 +62,7 @@ export function h(tag, attrs = {}, ...children) {
 
 export function errorNote(error) {
   const message = error && error.message ? error.message : String(error);
-  return h("p", { class: "error-note" }, `ошибка: ${message}`);
+  return h("p", { class: "error-note" }, `error: ${message}`);
 }
 
 export function isAbort(error) {
@@ -73,27 +73,27 @@ export function fmtTime(value) {
   if (!value) return "—";
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  const time = date.toLocaleTimeString("ru-RU", { hour12: false });
+  const time = date.toLocaleTimeString("en-US", { hour12: false });
   if (date.toDateString() === new Date().toDateString()) return time;
-  return `${date.toLocaleDateString("ru-RU")} ${time}`;
+  return `${date.toLocaleDateString("en-US")} ${time}`;
 }
 
 export function fmtDuration(seconds) {
   const total = Number(seconds);
   if (!Number.isFinite(total) || total < 0) return "—";
   const rounded = Math.round(total);
-  if (rounded < 60) return `${rounded} с`;
+  if (rounded < 60) return `${rounded}s`;
   const minutes = Math.floor(rounded / 60);
-  if (minutes < 60) return `${minutes} мин ${rounded % 60} с`;
+  if (minutes < 60) return `${minutes}m ${rounded % 60}s`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} ч ${minutes % 60} мин`;
-  return `${Math.floor(hours / 24)} д ${hours % 24} ч`;
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
 }
 
 export function fmtTokens(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
-  return Math.round(number).toLocaleString("ru-RU");
+  return Math.round(number).toLocaleString("en-US");
 }
 
 // --- routing ------------------------------------------------------------------
@@ -126,9 +126,9 @@ function show() {
       h(
         "section",
         { class: "page" },
-        h("h1", {}, "Не найдено"),
-        h("p", { class: "muted" }, `Неизвестный маршрут: ${location.hash || "(пусто)"}`),
-        h("p", {}, h("a", { href: "#/now" }, "На «Сейчас»")),
+        h("h1", {}, "Not found"),
+        h("p", { class: "muted" }, `Unknown route: ${location.hash || "(empty)"}`),
+        h("p", {}, h("a", { href: "#/now" }, "Go to Now")),
       ),
     );
     return;
@@ -139,7 +139,7 @@ function show() {
   rootEl.replaceChildren(view);
   document.title = page && page.title ? `${page.title} — agentbus` : "agentbus";
   if (!page) {
-    view.append(h("p", { class: "muted" }, `Страница «${match.name}» не зарегистрирована`));
+    view.append(h("p", { class: "muted" }, `Page "${match.name}" is not registered`));
     return;
   }
   const controller = new AbortController();
@@ -306,7 +306,7 @@ async function request(path, { signal, ...options } = {}) {
   });
   if (response.status === 401) {
     showLogin();
-    throw new AuthError("нужен вход по токену");
+    throw new AuthError("a token is required");
   }
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText} — ${path}`);
@@ -321,21 +321,21 @@ function showLogin() {
   const input = h("input", {
     type: "password",
     name: "token",
-    placeholder: "токен agentbus",
+    placeholder: "agentbus token",
     autocomplete: "off",
     required: true,
   });
   const form = h(
     "form",
     { class: "card login" },
-    h("h1", {}, "Вход"),
+    h("h1", {}, "Sign in"),
     h(
       "p",
       { class: "muted" },
-      "Введите токен agentbus. Он уходит только в /ui/login и не сохраняется в JS.",
+      "Enter the agentbus token. It is sent only to /ui/login and is not stored in JS.",
     ),
     input,
-    h("button", { type: "submit" }, "Войти"),
+    h("button", { type: "submit" }, "Sign in"),
   );
   form.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -458,7 +458,7 @@ const live = {
     const indicator = document.getElementById("conn");
     if (!indicator) return;
     indicator.dataset.mode = mode;
-    indicator.textContent = { live: "live", poll: "опрос", offline: "нет связи" }[mode] || mode;
+    indicator.textContent = { live: "live", poll: "polling", offline: "offline" }[mode] || mode;
   },
 
   closeStream() {
