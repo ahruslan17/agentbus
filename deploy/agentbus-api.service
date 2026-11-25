@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/personal/agentbus/bin/agentbus-api
+ExecStart=%h/agentbus/bin/agentbus-api
 Restart=on-failure
 RestartSec=5
 

@@ -1,7 +1,10 @@
 [project]
 name = "agentbus"
 version = "0.1.0"
-description = "Local message bus that lets Claude (VM cage) and local OpenCode agents talk to each other"
+description = "Task bus for a planner/executor loop between coding agents: Postgres queue, git worktrees, file bridge for network-less sandboxes"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Ruslan Akhmetzianov" }]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
