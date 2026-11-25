@@ -14,14 +14,14 @@ const COLLAPSE_LINES = 20;
 const BIG_DIFF_LINES = 3000;
 const REFRESH_KINDS = new Set(["created", "leased", "done", "failed", "cancelled", "requeued"]);
 
-registerPage("thread", { title: "Тред", render });
+registerPage("thread", { title: "Thread", render });
 
 function render(root, params, ctx) {
   const id = params.id;
   if (!id) {
     root.replaceChildren(
-      h("h1", {}, "Тред"),
-      h("p", { class: "muted" }, "Выберите тред в «Сейчас» или «Истории»."),
+      h("h1", {}, "Thread"),
+      h("p", { class: "muted" }, "Pick a thread in Now or History."),
     );
     return;
   }
@@ -34,8 +34,8 @@ function render(root, params, ctx) {
   root.replaceChildren(
     status,
     header,
-    block("Таймлайн", timeline),
-    block("События треда", eventsBox),
+    block("Timeline", timeline),
+    block("Thread events", eventsBox),
   );
 
   const parts = [];
@@ -91,11 +91,11 @@ function render(root, params, ctx) {
       h(
         "div",
         { class: "thread-meta muted" },
-        metaItem("репозиторий", thread.repo || "—"),
-        metaItem("ветка", branch || "—"),
-        metaItem("база", thread.base_ref || "—"),
-        metaItem("создал", thread.created_by || "—"),
-        metaItem("создан", fmtTime(thread.created_at)),
+        metaItem("repository", thread.repo || "—"),
+        metaItem("branch", branch || "—"),
+        metaItem("base", thread.base_ref || "—"),
+        metaItem("created by", thread.created_by || "—"),
+        metaItem("created", fmtTime(thread.created_at)),
       ),
     ];
   }
@@ -126,8 +126,8 @@ function render(root, params, ctx) {
   }
 
   function attachDiff(card, message) {
-    const body = h("div", { class: "diff-body" }, h("p", { class: "muted" }, "загрузка диффа…"));
-    const box = h("details", { class: "diff-box" }, h("summary", {}, "дифф"), body);
+    const body = h("div", { class: "diff-body" }, h("p", { class: "muted" }, "loading diff…"));
+    const box = h("details", { class: "diff-box" }, h("summary", {}, "diff"), body);
     box.open = true;
     card.extras.append(box);
     ctx
@@ -137,17 +137,17 @@ function render(root, params, ctx) {
       })
       .catch((error) => {
         if (isAbort(error)) return;
-        body.replaceChildren(h("p", { class: "muted" }, `дифф не загрузился: ${error.message}`));
+        body.replaceChildren(h("p", { class: "muted" }, `failed to load diff: ${error.message}`));
       });
   }
 
   function attachLog(card, message) {
     const feed = h("div", { class: "feed" });
-    const empty = h("p", { class: "muted" }, "лог пуст");
+    const empty = h("p", { class: "muted" }, "log is empty");
     const box = h(
       "details",
       { class: "feed-box" },
-      h("summary", {}, "лента исполнителя"),
+      h("summary", {}, "executor feed"),
       empty,
       feed,
     );
@@ -174,7 +174,7 @@ function render(root, params, ctx) {
       } catch (error) {
         if (tail.timer) clearInterval(tail.timer);
         if (isAbort(error)) return;
-        if (!tail.seen) empty.textContent = `лог недоступен: ${error.message}`;
+        if (!tail.seen) empty.textContent = `log unavailable: ${error.message}`;
       }
     }
 
@@ -226,10 +226,10 @@ function bodyBlock(text) {
   const body = h("div", { class: "body" }, text || "");
   if (String(text || "").split("\n").length <= COLLAPSE_LINES) return body;
   body.classList.add("collapsed");
-  const toggle = h("button", { class: "link-button", type: "button" }, "показать всё");
+  const toggle = h("button", { class: "link-button", type: "button" }, "show all");
   toggle.addEventListener("click", () => {
     const collapsed = body.classList.toggle("collapsed");
-    toggle.textContent = collapsed ? "показать всё" : "свернуть";
+    toggle.textContent = collapsed ? "show all" : "collapse";
   });
   return h("div", { class: "body-wrap" }, body, toggle);
 }
@@ -239,13 +239,13 @@ function resultFacts(message) {
   const meta = message.meta || {};
   const facts = [];
   if (meta.duration_seconds !== undefined && meta.duration_seconds !== null) {
-    facts.push(`длительность ${fmtDuration(meta.duration_seconds)}`);
+    facts.push(`duration ${fmtDuration(meta.duration_seconds)}`);
   }
   const tokens = meta.usage && meta.usage.tokens;
-  if (tokens) facts.push(`токены ${fmtTokens(tokens.input)} / ${fmtTokens(tokens.output)}`);
-  if (meta.model) facts.push(`модель ${meta.model}`);
+  if (tokens) facts.push(`tokens ${fmtTokens(tokens.input)} / ${fmtTokens(tokens.output)}`);
+  if (meta.model) facts.push(`model ${meta.model}`);
   if (meta.harness) facts.push(`harness ${meta.harness}`);
-  if (meta.timeout) facts.push("таймаут");
+  if (meta.timeout) facts.push("timeout");
   const nodes = [];
   if (facts.length) {
     nodes.push(h("div", { class: "facts" }, facts.map((fact) => h("span", { class: "badge" }, fact))));
@@ -258,7 +258,7 @@ function checksBlock(checks) {
   const skipped = checks.skipped;
   const ok = checks.ok === true;
   const label = skipped
-    ? `checks пропущены (${skipped})`
+    ? `checks skipped (${skipped})`
     : ok
       ? "checks ok"
       : `checks fail${checks.exit_code !== undefined ? ` (exit ${checks.exit_code})` : ""}`;
@@ -270,10 +270,10 @@ function checksBlock(checks) {
   if (!checks.tail) return h("div", { class: "checks" }, h("div", { class: "facts" }, badge));
   const tail = h("pre", { class: "checks-tail mono" }, checks.tail);
   tail.hidden = true;
-  const toggle = h("button", { class: "link-button", type: "button" }, "хвост");
+  const toggle = h("button", { class: "link-button", type: "button" }, "tail");
   toggle.addEventListener("click", () => {
     tail.hidden = !tail.hidden;
-    toggle.textContent = tail.hidden ? "хвост" : "скрыть хвост";
+    toggle.textContent = tail.hidden ? "tail" : "hide tail";
   });
   return h("div", { class: "checks" }, h("div", { class: "facts" }, badge, toggle), tail);
 }
@@ -285,7 +285,7 @@ function artifactLinks(message) {
     h(
       "div",
       { class: "artifacts" },
-      h("span", { class: "muted" }, "артефакты:"),
+      h("span", { class: "muted" }, "artifacts:"),
       ...names.map((name) =>
         h(
           "a",
@@ -309,7 +309,7 @@ function appendLogRow(feed, row) {
     "div",
     { class: `log-row log-${row.type}`, tabindex: "0", role: "button" },
     h("span", { class: "log-time" }, timeOf(row.ts)),
-    h("span", { class: "log-tool mono" }, row.tool || (row.type === "text" ? "агент" : row.type)),
+    h("span", { class: "log-tool mono" }, row.tool || (row.type === "text" ? "agent" : row.type)),
     h("span", { class: "log-summary" }, row.summary || ""),
     h("span", { class: "log-status" }, row.status || ""),
   );
@@ -327,7 +327,7 @@ function appendLogRow(feed, row) {
 
 function eventRows(events) {
   if (!Array.isArray(events) || !events.length) {
-    return [h("p", { class: "muted" }, "событий нет")];
+    return [h("p", { class: "muted" }, "no events")];
   }
   return events.map((event) =>
     h(
@@ -358,13 +358,13 @@ function lastBranch(messages) {
 }
 
 function threadState(messages) {
-  if (!messages.length) return "пусто";
-  if (messages.some((message) => message.state === "leased")) return "в работе";
+  if (!messages.length) return "empty";
+  if (messages.some((message) => message.state === "leased")) return "in progress";
   const last = messages[messages.length - 1];
-  if (last.kind === "result" && last.state === "queued") return "ждёт ревью";
-  if (messages.some((message) => message.state === "queued")) return "в очереди";
-  if (messages.some((message) => message.state === "failed")) return "сбой";
-  return "готово";
+  if (last.kind === "result" && last.state === "queued") return "awaiting review";
+  if (messages.some((message) => message.state === "queued")) return "queued";
+  if (messages.some((message) => message.state === "failed")) return "failed";
+  return "done";
 }
 
 function metaItem(name, value) {
@@ -375,7 +375,7 @@ function timeOf(timestamp) {
   if (!timestamp) return "";
   const date = new Date(Number(timestamp) * 1000);
   if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleTimeString("ru-RU", { hour12: false });
+  return date.toLocaleTimeString("en-US", { hour12: false });
 }
 
 // --- unified diff -------------------------------------------------------------
@@ -467,8 +467,8 @@ function renderDiff(text, truncated) {
     );
     return details;
   });
-  if (!files.length) nodes.push(h("p", { class: "muted" }, "дифф пуст"));
-  if (truncated) nodes.push(h("p", { class: "muted" }, "дифф обрезан сервером"));
+  if (!files.length) nodes.push(h("p", { class: "muted" }, "diff is empty"));
+  if (truncated) nodes.push(h("p", { class: "muted" }, "diff was truncated by the server"));
   return nodes;
 }
 

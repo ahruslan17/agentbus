@@ -5,13 +5,13 @@ const TICK_MS = 15_000;
 const STYLE_ID = "t7-mailboxes-style";
 
 const COLUMNS = [
-  { label: "Ящик" },
-  { label: "Задач", num: true, title: "Сколько задач отправил ящик" },
-  { label: "В работе", num: true, title: "Треды ящика с сообщением в lease" },
-  { label: "Ждут ревью", num: true, title: "Результаты в очереди" },
-  { label: "Принято", num: true, title: "Результаты с state_note accept*" },
-  { label: "Сбои", num: true, title: "Сообщения ящика в состоянии failed" },
-  { label: "Последняя активность" },
+  { label: "Mailbox" },
+  { label: "Tasks", num: true, title: "How many tasks the mailbox sent" },
+  { label: "In progress", num: true, title: "Mailbox threads with a message on lease" },
+  { label: "Awaiting review", num: true, title: "Results waiting in the queue" },
+  { label: "Accepted", num: true, title: "Results with state_note accept*" },
+  { label: "Failed", num: true, title: "Mailbox messages in the failed state" },
+  { label: "Last activity" },
 ];
 
 const STYLE = `
@@ -58,13 +58,13 @@ const STYLE = `
 }
 `;
 
-registerPage("mailboxes", { title: "Ящики", render });
+registerPage("mailboxes", { title: "Mailboxes", render });
 
 function render(root, _params, ctx) {
   ensureStyles();
 
   const status = h("div", { class: "status muted" });
-  const empty = h("p", { class: "muted" }, "ящиков пока нет");
+  const empty = h("p", { class: "muted" }, "no mailboxes yet");
   const body = h("tbody");
   const table = h(
     "div",
@@ -92,7 +92,7 @@ function render(root, _params, ctx) {
   );
   const cards = h("div", { class: "t7-mb-cards" });
 
-  root.replaceChildren(h("h1", {}, "Ящики"), status, empty, table, cards);
+  root.replaceChildren(h("h1", {}, "Mailboxes"), status, empty, table, cards);
   empty.hidden = true;
   table.hidden = true;
   cards.hidden = true;
@@ -154,12 +154,12 @@ function render(root, _params, ctx) {
       h(
         "span",
         { class: "t7-mb-grid" },
-        cardMetric("задач", formatCount(row.tasks)),
-        cardMetric("в работе", formatCount(row.in_work)),
-        cardMetric("ждут ревью", formatCount(row.awaiting_review)),
-        cardMetric("принято", formatCount(row.accepted)),
-        cardMetric("сбои", formatCount(row.failed)),
-        cardMetric("активность", fmtAgo(row.last_activity), fmtTime(row.last_activity)),
+        cardMetric("tasks", formatCount(row.tasks)),
+        cardMetric("in progress", formatCount(row.in_work)),
+        cardMetric("awaiting review", formatCount(row.awaiting_review)),
+        cardMetric("accepted", formatCount(row.accepted)),
+        cardMetric("failed", formatCount(row.failed)),
+        cardMetric("activity", fmtAgo(row.last_activity), fmtTime(row.last_activity)),
       ),
     );
   }
@@ -227,7 +227,7 @@ function formatCount(value) {
   if (value === null || value === undefined) return "—";
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
-  return number.toLocaleString("ru-RU");
+  return number.toLocaleString("en-US");
 }
 
 function fmtAgo(value) {
@@ -235,14 +235,14 @@ function fmtAgo(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "—";
   const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
-  if (seconds < 60) return "только что";
+  if (seconds < 60) return "just now";
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} мин назад`;
+  if (minutes < 60) return `${minutes} min ago`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} ч назад`;
+  if (hours < 24) return `${hours} h ago`;
   const days = Math.floor(hours / 24);
-  if (days < 30) return `${days} дн. назад`;
-  return date.toLocaleDateString("ru-RU");
+  if (days < 30) return `${days} d ago`;
+  return date.toLocaleDateString("en-US");
 }
 
 function ensureStyles() {

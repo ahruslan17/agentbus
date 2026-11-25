@@ -20,7 +20,7 @@ def send(client: TestClient, **overrides) -> dict:
         "sender": "cage-claude",
         "recipient": "local-opencode",
         "kind": "task",
-        "body": "сделай дело",
+        "body": "do the thing",
     }
     payload.update(overrides)
     response = client.post("/v1/messages", json=payload)
@@ -39,7 +39,7 @@ def reply(
     message: dict,
     *,
     sender: str = "local-opencode",
-    body: str = "готово",
+    body: str = "done",
     meta: dict | None = None,
 ) -> dict:
     response = client.post(
@@ -89,7 +89,7 @@ def test_overview_counts_queue_and_awaiting_review(client: TestClient) -> None:
 
 # 4
 def test_mailboxes_show_tasks_adopted_and_awaiting_review(client: TestClient) -> None:
-    task = send(client, sender="alice", body="первый")
+    task = send(client, sender="alice", body="first")
     lease(client)
 
     boxes = {row["mailbox"]: row for row in client.get("/v1/mailboxes").json()["mailboxes"]}
@@ -111,7 +111,7 @@ def test_mailboxes_show_tasks_adopted_and_awaiting_review(client: TestClient) ->
     assert boxes["alice"]["awaiting_review"] == 0
     assert boxes["alice"]["last_activity"] is not None
 
-    send(client, sender="bob", body="второй")
+    send(client, sender="bob", body="second")
     boxes = {row["mailbox"]: row for row in client.get("/v1/mailboxes").json()["mailboxes"]}
     assert boxes["bob"]["tasks"] == 1
     assert boxes["bob"]["awaiting_review"] == 0
@@ -191,7 +191,7 @@ def test_log_cursor_reply_fallback_and_running(client: TestClient, artifacts: st
             [
                 json.dumps({"type": "step_start", "timestamp": 1}),
                 json.dumps(
-                    {"type": "text", "timestamp": 2, "part": {"text": "готово", "time": {"end": 2}}}
+                    {"type": "text", "timestamp": 2, "part": {"text": "done", "time": {"end": 2}}}
                 ),
                 json.dumps(
                     {
@@ -237,7 +237,7 @@ def test_log_cursor_reply_fallback_and_running(client: TestClient, artifacts: st
 
 # 8
 def test_stats_by_mailbox_and_model(client: TestClient) -> None:
-    accepted = send(client, body="принят сразу")
+    accepted = send(client, body="accepted right away")
     lease(client)
     accepted_result = reply(
         client,
@@ -246,7 +246,7 @@ def test_stats_by_mailbox_and_model(client: TestClient) -> None:
     )
     finish(client, accepted_result, note="accept: ok")
 
-    reworked = send(client, body="пойдёт на доработку")
+    reworked = send(client, body="needs rework")
     lease(client)
     first_result = reply(
         client,
@@ -272,7 +272,7 @@ def test_stats_by_mailbox_and_model(client: TestClient) -> None:
             "sender": "local-opencode",
             "recipient": "cage-claude",
             "kind": "result",
-            "body": "переделал",
+            "body": "reworked",
             "thread_id": reworked["thread_id"],
             "parent_id": verdict.json()["id"],
             "meta": {"model": "deepseek", "usage": {"tokens": {"input": 3, "output": 2}}},
@@ -340,7 +340,7 @@ def test_log_tail_waits_for_the_unfinished_last_line(client: TestClient, artifac
     directory = Path(artifacts) / task["id"]
     directory.mkdir(parents=True)
     done = json.dumps(
-        {"type": "text", "timestamp": 1, "part": {"text": "готово", "time": {"end": 1}}}
+        {"type": "text", "timestamp": 1, "part": {"text": "done", "time": {"end": 1}}}
     )
     pending = json.dumps({"type": "step_finish", "part": {"tokens": {"input": 1, "output": 2}}})
     log = directory / "run.log"

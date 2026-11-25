@@ -63,12 +63,12 @@ def test_t7_pages_do_not_shim_the_hash(client: TestClient, page: str) -> None:
     assert "replaceState" not in client.get(f"/ui/{page}").text
 
 
-STUB_TEXT = "скоро — T7"
+STUB_TEXT = "coming soon — T7"
 
 
 @pytest.mark.parametrize("page", PAGES[2:])
 def test_t7_pages_replace_the_stubs(client: TestClient, page: str) -> None:
-    # T6 shipped stubs («скоро — T7»); T7 replaces the bodies and keeps the
+    # T6 shipped stubs ("coming soon — T7"); T7 replaces the bodies and keeps the
     # registration contract.
     text = client.get(f"/ui/{page}").text
     assert "registerPage" in text
