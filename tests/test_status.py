@@ -15,7 +15,7 @@ def send(client: TestClient, **overrides) -> dict:
         "sender": "cage-claude",
         "recipient": "local-opencode",
         "kind": "task",
-        "body": "сделай дело",
+        "body": "do the thing",
     }
     payload.update(overrides)
     response = client.post("/v1/messages", json=payload)
@@ -61,7 +61,7 @@ def status_of(client: TestClient, mailbox: str = "cage-claude") -> dict:
 
 def test_pending_shows_positions_the_lease_and_the_result(client: TestClient) -> None:
     first = send(client, meta={"ticket": "T11"})
-    second = send(client, body="вторая задача")
+    second = send(client, body="second task")
 
     pending = {item["id"]: item for item in status_of(client)["pending"]}
     assert pending[first["id"]]["state"] == "queued"
@@ -82,7 +82,7 @@ def test_pending_shows_positions_the_lease_and_the_result(client: TestClient) ->
 
     result = client.post(
         f"/v1/messages/{first['id']}/reply",
-        json={"sender": "local-opencode", "kind": "result", "body": "готово"},
+        json={"sender": "local-opencode", "kind": "result", "body": "finished"},
     ).json()
 
     pending = {item["id"]: item for item in status_of(client)["pending"]}
@@ -92,7 +92,7 @@ def test_pending_shows_positions_the_lease_and_the_result(client: TestClient) ->
 
 
 def test_foreign_slot_exposes_only_the_sender(client: TestClient) -> None:
-    secret = "секретный текст чужой задачи"
+    secret = "secret body of another agent's task"
     task = send(client, sender="bob", body=secret, meta={"ticket": "SECRET-1"})
     lease(client, owner="local-opencode#0")
     report_slot(client, message_id=task["id"])
@@ -124,18 +124,18 @@ def test_own_slot_shows_ticket_and_thread(client: TestClient) -> None:
 
 
 def test_status_never_contains_message_bodies(client: TestClient) -> None:
-    task = send(client, body="конфиденциальный текст задачи")
+    task = send(client, body="confidential task body")
     lease(client)
     report_slot(client, message_id=task["id"])
 
     dumped = json.dumps(status_of(client), ensure_ascii=False)
-    assert "конфиденциальный текст задачи" not in dumped
+    assert "confidential task body" not in dumped
 
 
 def test_events_cover_only_own_threads(client: TestClient) -> None:
     task = send(client, meta={"ticket": "T11"})
     lease(client)
-    send(client, sender="bob", body="чужая задача")
+    send(client, sender="bob", body="another agent's task")
 
     status = status_of(client)
     assert {event["thread_id"] for event in status["events"]} == {task["thread_id"]}

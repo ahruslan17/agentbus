@@ -4,11 +4,11 @@
 Everything it does is files inside the agent's own mailbox folder in the share:
 
     cb init                          # create the mailbox (or `cb init my-name`)
-    cb send --to local-opencode --repo /path/to/repo "сделай X"   # -> outbox/
+    cb send --to local-opencode --repo /path/to/repo "do X"        # -> outbox/
     cb inbox                                                      # new messages
     cb show m_...                                                 # message.json
     cb body m_... | cb patch m_...                                 # text / diff
-    cb reply m_... --kind verdict "правь Y"                        # -> outbox/
+    cb reply m_... --kind verdict "fix Y"                          # -> outbox/
     cb wait m_... [--all] [--timeout 600]                          # answers by parent_id
     cb status [--json] [--log] [id ...]                            # queue state from status.json
     cb accept m_... [--note "..."]                                 # accept a result
@@ -267,7 +267,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     shown.update({k: v for k, v in payload.items() if k != "body"})
     code = print_with_receipt(root, path, shown, args.wait_id)
     if code == 0:
-        print("host заберёт файл в течение пары секунд", file=sys.stderr)
+        print("the host will pick the file up within a couple of seconds", file=sys.stderr)
     return code
 
 
@@ -327,17 +327,17 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             print(folder.name)
         else:
             ticket = ticket_of(root, message)
-            suffix = f"  тикет {ticket}" if ticket else ""
+            suffix = f"  ticket {ticket}" if ticket else ""
             first = (message.get("body") or "").strip().splitlines()
-            print(f"{message['id']}  [{message['kind']}] от {message['sender']}  "
-                  f"тред {message.get('thread_id')}{suffix}")
+            print(f"{message['id']}  [{message['kind']}] from {message['sender']}  "
+                  f"thread {message.get('thread_id')}{suffix}")
             if first:
                 print(f"    {first[0][:160]}")
             if message.get("artifacts"):
-                print(f"    файлы: {', '.join(message['artifacts'])}")
+                print(f"    files: {', '.join(message['artifacts'])}")
         shown += 1
     if not shown and not args.folder:
-        print("новых сообщений нет")
+        print("no new messages")
     return 0
 
 
@@ -346,9 +346,9 @@ def cmd_show(args: argparse.Namespace) -> int:
     message = read_message(root, args.message_id)
     if args.text:
         ticket = ticket_of(root, message)
-        suffix = f"  тикет {ticket}" if ticket else ""
-        print(f"# {message['id']} [{message['kind']}] от {message['sender']} "
-              f"тред {message.get('thread_id')}{suffix}\n")
+        suffix = f"  ticket {ticket}" if ticket else ""
+        print(f"# {message['id']} [{message['kind']}] from {message['sender']} "
+              f"thread {message.get('thread_id')}{suffix}\n")
         print(message.get("body") or "")
         stat = (message.get("meta") or {}).get("diff_stat")
         if stat:
@@ -658,7 +658,7 @@ def cmd_sent(args: argparse.Namespace) -> int:
             detail = error.read_text(encoding="utf-8").strip() if error.is_file() else ""
             print(f"failed {path.name}  {detail[:120]}")
     if not names and not (failed.is_dir() and any(failed.iterdir())):
-        print("пусто")
+        print("empty")
     return 0
 
 
@@ -703,11 +703,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cb", description="agentbus client over a shared directory")
     sub = parser.add_subparsers(dest="command", required=True, parser_class=_SubParser)
 
-    init = sub.add_parser("init", help="создать ящик")
+    init = sub.add_parser("init", help="create the mailbox")
     init.add_argument("name", nargs="?")
     init.set_defaults(func=cmd_init)
 
-    send = sub.add_parser("send", help="положить сообщение в outbox")
+    send = sub.add_parser("send", help="queue a message in outbox")
     send.add_argument("--to", required=True)
     send.add_argument("--kind", default="task")
     send.add_argument("--thread")
@@ -716,69 +716,69 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--parent")
     send.add_argument("--meta", default="{}")
     send.add_argument("--wait-id", type=float, default=15.0,
-                      help="сколько секунд ждать квитанцию с id (0 — не ждать)")
+                      help="seconds to wait for a receipt with the id (0 = don't wait)")
     send.add_argument("--body-file")
     send.add_argument("--body")
     send.add_argument("text", nargs="*")
     send.set_defaults(func=cmd_send)
 
-    reply = sub.add_parser("reply", help="ответить на сообщение")
+    reply = sub.add_parser("reply", help="answer a message")
     reply.add_argument("message_id")
     reply.add_argument("--kind", default="verdict")
     reply.add_argument("--meta", default="{}")
     reply.add_argument("--wait-id", type=float, default=15.0,
-                       help="сколько секунд ждать квитанцию с id (0 — не ждать)")
+                       help="seconds to wait for a receipt with the id (0 = don't wait)")
     reply.add_argument("--body-file")
     reply.add_argument("--body")
     reply.add_argument("text", nargs="*")
     reply.set_defaults(func=cmd_reply)
 
-    inbox = sub.add_parser("inbox", help="новые сообщения")
-    inbox.add_argument("--folder", action="store_true", help="только id")
+    inbox = sub.add_parser("inbox", help="new messages")
+    inbox.add_argument("--folder", action="store_true", help="ids only")
     inbox.set_defaults(func=cmd_inbox)
 
-    show = sub.add_parser("show", help="сообщение целиком")
+    show = sub.add_parser("show", help="the whole message")
     show.add_argument("message_id")
     show.add_argument("--text", action="store_true")
     show.set_defaults(func=cmd_show)
 
-    body = sub.add_parser("body", help="текст сообщения")
+    body = sub.add_parser("body", help="message text")
     body.add_argument("message_id")
     body.set_defaults(func=cmd_body)
 
-    patch = sub.add_parser("patch", help="diff из ответа исполнителя")
+    patch = sub.add_parser("patch", help="diff from the executor's reply")
     patch.add_argument("message_id")
     patch.set_defaults(
         func=lambda a: cmd_file(argparse.Namespace(message_id=a.message_id, name="patch.diff"))
     )
 
-    read = sub.add_parser("read", help="перенести в read/")
+    read = sub.add_parser("read", help="move to read/")
     read.add_argument("message_id")
     read.set_defaults(func=cmd_read)
 
-    accept = sub.add_parser("accept", help="принять результат и перенести в read/")
+    accept = sub.add_parser("accept", help="accept the result and move it to read/")
     accept.add_argument("message_id")
     accept.add_argument("--note")
     accept.set_defaults(func=cmd_accept)
 
-    wait = sub.add_parser("wait", help="ждать ответы по parent_id")
+    wait = sub.add_parser("wait", help="wait for replies by parent_id")
     wait.add_argument("ids", nargs="+")
-    wait.add_argument("--all", action="store_true", help="ждать ответы на все id")
-    wait.add_argument("--any", action="store_true", help="вернуться после первого (по умолчанию)")
+    wait.add_argument("--all", action="store_true", help="wait for replies to every id")
+    wait.add_argument("--any", action="store_true", help="return after the first one (default)")
     wait.add_argument("--timeout", type=float, default=3600.0)
     wait.set_defaults(func=cmd_wait)
 
-    sent = sub.add_parser("sent", help="что ушло в очередь")
+    sent = sub.add_parser("sent", help="what went to the queue")
     sent.set_defaults(func=cmd_sent)
 
-    status = sub.add_parser("status", help="состояние очереди из status.json")
+    status = sub.add_parser("status", help="queue state from status.json")
     status.add_argument("ids", nargs="*")
-    status.add_argument("--json", action="store_true", help="сырой status.json")
+    status.add_argument("--json", action="store_true", help="raw status.json")
     status.add_argument("--log", action="store_true",
-                        help="хвост run.log занятых сообщений")
+                        help="log tail of leased messages")
     status.set_defaults(func=cmd_status)
 
-    env = sub.add_parser("env", help="пути и состояние")
+    env = sub.add_parser("env", help="paths and state")
     env.set_defaults(func=cmd_env)
 
     return parser
