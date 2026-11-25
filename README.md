@@ -293,10 +293,16 @@ systemctl --user restart --no-block agentbus-worker
 `~/.local/state/agentbus/worktrees/<thread>` через `git worktree remove --force`,
 `artifacts/<message_id>` и `threads/<thread>.json`. Строки в БД не трогаются.
 
+Worktree с несохранённой работой пропускается вместе с артефактами и base-файлом:
+грязный `git status` (`uncommitted changes: N files`, игнорируемое вроде `.venv/` не
+считается) или detached HEAD с коммитами, которых нет в `master`/`main`. Ветка треда
+коммиты сохраняет, поэтому обычный HEAD проверять не нужно.
+
 ```bash
-make prune PRUNE_ARGS=--dry-run   # только план
+make prune PRUNE_ARGS=--dry-run   # только план, в том числе пропущенные грязные
 make prune KEEP=20                # удалить лишнее
 make prune PRUNE_ARGS=--delete-merged-branches  # плюс ветки, влитые в master/main
+make prune PRUNE_ARGS=--force-dirty  # удалить и worktree с несохранённой работой
 ```
 
 Ветка удаляется только через `git branch -d`, то есть лишь если она целиком влита в

@@ -11,6 +11,11 @@ rest this removes
 and, with `--delete-merged-branches`, the branch `agentbus/<thread>` if it is fully
 merged into the repository's `master`/`main` (`git branch -d`, never `-D`).
 
+A worktree with unsaved work is kept together with its artifacts and base file: its
+`git status` is not clean, or its HEAD is detached and not an ancestor of
+`master`/`main`. `--force-dirty` removes such worktrees anyway (as older versions
+did); in a dry run the ignored reasons are still printed.
+
 Rows in Postgres are never touched. `--dry-run` prints the same plan and does nothing.
 Repositories outside `AGENTBUS_REPOS` are skipped with a warning: the state directory
 is ours, the repository may belong to another owner.
@@ -74,6 +79,7 @@ class Plan:
     base_files: list[Path] = field(default_factory=list)
     branches: list[tuple[Path, str]] = field(default_factory=list)  # (repo, branch)
     skipped: list[str] = field(default_factory=list)
+    dirty: list[tuple[Path, str]] = field(default_factory=list)  # (worktree, reason)
     failures: list[str] = field(default_factory=list)
 
 
@@ -149,8 +155,40 @@ def _merged(repo: Path, branch: str) -> bool:
     return False
 
 
+def _merged_head(repo: Path) -> bool:
+    """True when the commit checked out in `repo` is an ancestor of master or main."""
+    for base in BASE_BRANCHES:
+        if not _branch_exists(repo, base):
+            continue
+        if _git(repo, "merge-base", "--is-ancestor", "HEAD", base).returncode == 0:
+            return True
+    return False
+
+
+def _dirty_reason(worktree: Path) -> str | None:
+    """Why `worktree` holds work that removal would lose, or `None` when it is safe."""
+    status = _git(worktree, "status", "--porcelain", "--untracked-files=normal")
+    if status.returncode != 0:
+        return status.stderr.strip() or f"git status exited {status.returncode}"
+    changed = [line for line in status.stdout.splitlines() if line.strip()]
+    if changed:
+        return f"uncommitted changes: {len(changed)} files"
+
+    head = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+    if head.returncode != 0:
+        return head.stderr.strip() or f"git rev-parse exited {head.returncode}"
+    if head.stdout.strip() == "HEAD" and not _merged_head(worktree):
+        return "detached HEAD with unmerged commits"
+    return None
+
+
 def build_plan(
-    settings: PruneSettings, records: list[ThreadRecord], *, delete_merged_branches: bool
+    settings: PruneSettings,
+    records: list[ThreadRecord],
+    *,
+    delete_merged_branches: bool,
+    force_dirty: bool = False,
+    dry_run: bool = False,
 ) -> Plan:
     plan = Plan()
     for record in records:
@@ -165,6 +203,15 @@ def build_plan(
                 )
                 plan.skipped.append(f"worktree {worktree}: {reason}")
             else:
+                # The check is off with --force-dirty, but a dry run still reports it.
+                reason = _dirty_reason(worktree) if dry_run or not force_dirty else None
+                if reason and not force_dirty:
+                    plan.dirty.append((worktree, reason))
+                    plan.skipped.append(f"worktree {worktree}: {reason}")
+                    # Artifacts and the base commit are the only other ways back.
+                    continue
+                if reason and dry_run:
+                    plan.skipped.append(f"worktree {worktree}: {reason} (ignored by --force-dirty)")
                 plan.worktrees.append((repo, worktree))
 
         for message_id in record.message_ids:
@@ -257,6 +304,7 @@ def run(
     keep: int = DEFAULT_KEEP,
     dry_run: bool = False,
     delete_merged_branches: bool = False,
+    force_dirty: bool = False,
 ) -> Plan:
     with store.connect(settings.database_url) as conn:
         records = closed_threads(conn)
@@ -265,12 +313,19 @@ def run(
         f"{len(records)} closed threads, keeping {min(keep, len(records))}, "
         f"pruning {len(selected)}{' (dry run)' if dry_run else ''}"
     )
-    plan = build_plan(settings, selected, delete_merged_branches=delete_merged_branches)
+    plan = build_plan(
+        settings,
+        selected,
+        delete_merged_branches=delete_merged_branches,
+        force_dirty=force_dirty,
+        dry_run=dry_run,
+    )
     apply_plan(plan, dry_run=dry_run)
     for warning in plan.skipped:
         print(f"skipped {warning}", file=sys.stderr)
     for failure in plan.failures:
         print(f"failed to remove {failure}", file=sys.stderr)
+    print(f"skipped {len(plan.dirty)} dirty worktrees")
     return plan
 
 
@@ -286,6 +341,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also `git branch -d` thread branches merged into master/main",
     )
+    parser.add_argument(
+        "--force-dirty",
+        action="store_true",
+        help="remove worktrees with uncommitted changes or an unmerged detached HEAD",
+    )
     args = parser.parse_args(argv)
     if args.keep < 0:
         parser.error("--keep must be 0 or more")
@@ -295,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         keep=args.keep,
         dry_run=args.dry_run,
         delete_merged_branches=args.delete_merged_branches,
+        force_dirty=args.force_dirty,
     )
     return 1 if plan.failures else 0
 
