@@ -1,6 +1,5 @@
 import { errorNote, fmtDuration, fmtTokens, h, isAbort, registerPage } from "../app.js";
 
-const ROUTE = "/stats";
 const STYLE_ID = "t7-stats-style";
 const GROUPS = [
   ["mailbox", "ящик"],
@@ -96,50 +95,17 @@ const STYLE = `
 .t7-table-wrap[hidden] { display: none; }
 `;
 
-let hashQuery = "";
-let restoreTimer = null;
-
-// Same router limitation as on the history page: keep `?group=` out of the hash
-// while `app.js` matches the route, then restore the shareable link.
-adoptHash();
-window.addEventListener("hashchange", adoptHash);
-
 registerPage("stats", { title: "Статистика", render });
 
-function adoptHash() {
-  const raw = location.hash.replace(/^#/, "");
-  if (raw === ROUTE) {
-    hashQuery = "";
-    return;
-  }
-  if (!raw.startsWith(`${ROUTE}?`)) return;
-  hashQuery = raw.slice(ROUTE.length + 1);
-  history.replaceState(null, "", `#${ROUTE}`);
-  if (restoreTimer) clearTimeout(restoreTimer);
-  restoreTimer = setTimeout(restoreHash, 0);
-}
-
-function restoreHash() {
-  restoreTimer = null;
-  if (location.hash !== `#${ROUTE}`) return;
-  history.replaceState(null, "", `#${ROUTE}?${hashQuery}`);
-}
-
-function currentQuery() {
-  if (hashQuery) return hashQuery;
-  const index = location.hash.indexOf("?");
-  return index >= 0 ? location.hash.slice(index + 1) : "";
-}
-
-function readGroup() {
-  const group = new URLSearchParams(currentQuery()).get("group");
+function readGroup(query) {
+  const group = query ? query.group : "";
   return GROUPS.some(([value]) => value === group) ? group : "mailbox";
 }
 
-function render(root, _params, ctx) {
+function render(root, params, ctx) {
   ensureStyles();
 
-  let group = readGroup();
+  let group = readGroup(params.query);
   let requestSeq = 0;
 
   const status = h("div", { class: "status muted" });
@@ -225,10 +191,15 @@ function render(root, _params, ctx) {
 
   function selectGroup(value) {
     if (value === group) return;
-    group = value;
+    ctx.setQuery({ group: value });
+  }
+
+  // `ctx.setQuery` and Back/forward both land here, without a full re-render.
+  function applyQuery(query) {
+    const next = readGroup(query);
+    if (next === group) return;
+    group = next;
     syncButtons();
-    hashQuery = `group=${value}`;
-    history.pushState(null, "", `#${ROUTE}?${hashQuery}`);
     load();
   }
 
@@ -291,6 +262,8 @@ function render(root, _params, ctx) {
   }
 
   load();
+
+  ctx.onQuery(applyQuery);
 
   ctx.onUnmount(() => {
     requestSeq += 1;
