@@ -6,6 +6,7 @@ tests need neither the API nor Postgres.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import subprocess
@@ -474,3 +475,220 @@ def test_accept_writes_decision_and_moves_to_read(tmp_path: Path) -> None:
     decision = json.loads((box / "read" / "m_result" / "decision.json").read_text(encoding="utf-8"))
     assert decision == {"decision": "accept", "note": "всё ок"}
     assert (box / "read" / "m_result" / "message.json").is_file()
+
+
+# --- 5. status.json ---------------------------------------------------------
+
+
+def utc_iso(offset_seconds: float = 0.0) -> str:
+    moment = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=offset_seconds)
+    return moment.isoformat()
+
+
+def status_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "workers": [],
+        "queues": [],
+        "pending": [],
+        "events": [],
+        "generated_at": utc_iso(),
+        "bridge": {"pid": 1, "interval": 5},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def write_status(mailbox: Path, payload: dict[str, Any]) -> Path:
+    return write_json(mailbox / "status.json", payload)
+
+
+def message_item(**overrides: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "id": "m_task",
+        "thread_id": "t_1",
+        "kind": "task",
+        "ticket": "T11",
+        "state": "leased",
+        "attempt": 1,
+        "lease_owner": "local-opencode#0",
+        "lease_until": utc_iso(600),
+        "created_at": utc_iso(-60),
+        "updated_at": utc_iso(-30),
+        "result_id": None,
+        "queue_position": None,
+    }
+    item.update(overrides)
+    return item
+
+
+def slot_item(**overrides: Any) -> dict[str, Any]:
+    slot: dict[str, Any] = {
+        "id": "local-opencode#0",
+        "state": "busy",
+        "model": "deepseek",
+        "harness": "opencode",
+        "heartbeat_at": utc_iso(),
+        "stale": False,
+        "message_id": "m_task",
+        "ticket": "T11",
+        "thread_id": "t_1",
+    }
+    slot.update(overrides)
+    return slot
+
+
+def test_status_prints_freshness_slots_and_messages(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+    write_status(
+        box,
+        status_payload(
+            workers=[
+                slot_item(),
+                slot_item(
+                    id="local-opencode#1",
+                    state="idle",
+                    message_id=None,
+                    ticket=None,
+                    thread_id=None,
+                ),
+            ],
+            pending=[
+                message_item(),
+                message_item(
+                    id="m_next",
+                    state="queued",
+                    attempt=0,
+                    lease_owner=None,
+                    lease_until=None,
+                    queue_position=2,
+                    ticket=None,
+                ),
+                message_item(id="m_old", state="done", result_id="m_result"),
+            ],
+        ),
+    )
+
+    result = run_cb(["status"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("status: ")
+    assert lines[0].endswith("s ago")
+    assert "local-opencode#0 busy m_task [T11]" in result.stdout
+    assert "local-opencode#1 idle" in result.stdout
+    assert "m_task [T11] leased by local-opencode#0, attempt 1" in result.stdout
+    assert "m_next queued, ~2nd in line" in result.stdout
+    assert "m_old [T11] done → result m_result" in result.stdout
+
+
+def test_status_marks_a_stale_slot(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+    write_status(box, status_payload(workers=[slot_item(stale=True)]))
+
+    result = run_cb(["status"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 0, result.stderr
+    assert "local-opencode#0 stale" in result.stdout
+
+
+def test_status_is_stale_for_an_old_file(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+    write_status(box, status_payload(generated_at=utc_iso(-60)))
+
+    result = run_cb(["status"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 2
+    assert "stale" in result.stdout
+
+
+def test_status_without_a_file_is_stale(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+
+    result = run_cb(["status"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 2
+    assert "stale" in result.stdout
+
+
+def test_status_json_prints_the_raw_file(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+    payload = status_payload(pending=[message_item()])
+    write_status(box, payload)
+
+    result = run_cb(["status", "--json"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == payload
+
+
+def test_status_filters_ids_and_shows_the_log_tail(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+    write_status(
+        box,
+        status_payload(
+            pending=[
+                message_item(log_tail=["make check", "tests passed"]),
+                message_item(id="m_other", state="queued", queue_position=1, lease_owner=None),
+            ]
+        ),
+    )
+
+    result = run_cb(["status", "m_task", "--log"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 0, result.stderr
+    assert "m_task" in result.stdout
+    assert "m_other" not in result.stdout
+    assert "    make check" in result.stdout
+    assert "    tests passed" in result.stdout
+
+
+def test_status_error_payload_is_reported(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+    write_status(box, status_payload(error="api unavailable: connection refused"))
+
+    result = run_cb(["status"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 2
+    assert "error: api unavailable" in result.stdout
+
+
+def test_wait_prints_status_transitions(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+    write_status(
+        box,
+        status_payload(
+            pending=[message_item(id="m_a", state="queued", lease_owner=None, queue_position=1)]
+        ),
+    )
+
+    def writer() -> None:
+        time.sleep(1.0)
+        write_status(box, status_payload(pending=[message_item(id="m_a", state="leased")]))
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    result = run_cb(["wait", "m_a", "--timeout", "3"], env={"AGENTBUS_SHARE": str(box)})
+    thread.join(timeout=10)
+
+    assert result.returncode == 2, result.stderr
+    assert "m_a queued → leased by local-opencode#0" in result.stderr
+
+
+def test_env_reports_the_status_age(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+    write_status(box, status_payload(generated_at=utc_iso(-5)))
+
+    result = run_cb(["env"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 0, result.stderr
+    printed = json.loads(result.stdout)
+    assert printed["status_age_seconds"] in (4, 5, 6)
+
+
+def test_env_status_age_is_null_without_a_file(tmp_path: Path) -> None:
+    box = make_mailbox(tmp_path / "box")
+
+    result = run_cb(["env"], env={"AGENTBUS_SHARE": str(box)})
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["status_age_seconds"] is None

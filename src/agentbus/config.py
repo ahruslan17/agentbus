@@ -66,6 +66,8 @@ class BridgeSettings:
     token: str
     state_dir: str
     interval: float
+    # Seconds between status.json writes; 0 turns the status file off.
+    status_interval: float = 5.0
 
     @classmethod
     def from_env(cls) -> BridgeSettings:
@@ -88,6 +90,7 @@ class BridgeSettings:
                 os.environ.get("AGENTBUS_STATE_DIR", "~/.local/state/agentbus")
             ),
             interval=float(os.environ.get("AGENTBUS_BRIDGE_INTERVAL", "2")),
+            status_interval=float(os.environ.get("AGENTBUS_STATUS_INTERVAL", "5")),
         )
 
 

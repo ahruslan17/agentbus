@@ -27,6 +27,7 @@ import re
 import shutil
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,8 @@ from agentbus.config import BridgeSettings
 MAX_INBOX_BYTES = 5 * 1024 * 1024
 MAILBOX_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 ERROR_REPEAT_SECONDS = 300.0
+STATUS_LOG_LINES = 15
+STATUS_LOG_BYTES = 4 * 1024
 
 
 def log(message: str) -> None:
@@ -60,16 +63,25 @@ class Api:
 
 
 class Bridge:
-    def __init__(self, settings: BridgeSettings, api: Any, mailbox_dir: Path, agent: str) -> None:
+    def __init__(
+        self,
+        settings: BridgeSettings,
+        api: Any,
+        mailbox_dir: Path,
+        agent: str,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.settings = settings
         self.api = api
         self.agent = agent
+        self.clock = clock
         self.root = Path(mailbox_dir).expanduser()
         self.outbox = self.root / "outbox"
         self.sent = self.root / "sent"
         self.failed = self.root / "failed"
         self.inbox = self.root / "inbox"
         self.markers = Path(settings.state_dir).expanduser() / "bridge" / self.agent / "delivered"
+        self._status_at: float | None = None
         for path in (self.outbox, self.sent, self.failed, self.inbox, self.markers):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -241,6 +253,73 @@ class Bridge:
     def run_once(self) -> tuple[int, int, int]:
         return self.pump_outbox(), self.pump_inbox(), self.pump_read()
 
+    # --- queue -> VM: status.json ---------------------------------------------
+
+    def maybe_write_status(self) -> bool:
+        """Publish the queue state into the mailbox, at most once per interval.
+
+        Returns whether a fetch was attempted. A failed fetch still writes
+        `status.json` with `error` and then raises, so `MultiBridge` reports it with
+        the same throttle as a broken mailbox. The timestamp is set before the call:
+        a down API is retried next interval, not on every tick.
+        """
+        interval = self.settings.status_interval
+        if interval <= 0:
+            return False
+        now = self.clock()
+        if self._status_at is not None and now - self._status_at < interval:
+            return False
+        self._status_at = now
+        try:
+            response = self.api.get(f"/v1/mailboxes/{self.agent}/status")
+        except httpx.HTTPError as exc:
+            self._write_status({"error": f"api unavailable: {exc}"})
+            raise
+        if response.status_code != 200:
+            self._write_status({"error": f"api error {response.status_code}"})
+            raise RuntimeError(f"status fetch failed: {response.status_code}")
+        payload = response.json()
+        self._add_log_tails(payload)
+        self._write_status(payload)
+        return True
+
+    def _write_status(self, payload: dict[str, Any]) -> None:
+        body = dict(payload)
+        body["generated_at"] = datetime.now(UTC).isoformat()
+        body["bridge"] = {"pid": os.getpid(), "interval": self.settings.status_interval}
+        tmp = self.root / ".status.json.tmp"
+        tmp.write_text(
+            json.dumps(body, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, self.root / "status.json")
+
+    def _add_log_tails(self, payload: dict[str, Any]) -> None:
+        """Last log lines of leased messages of this mailbox, text only."""
+        for message in payload.get("pending") or []:
+            if message.get("state") != "leased":
+                continue
+            tail = self._log_tail(str(message.get("id")))
+            if tail:
+                message["log_tail"] = tail
+
+    def _log_tail(self, message_id: str) -> list[str]:
+        try:
+            response = self.api.get(f"/v1/messages/{message_id}/log")
+        except httpx.HTTPError:
+            return []
+        if response.status_code != 200:
+            return []
+        rows = (response.json() or {}).get("lines") or []
+        lines = [
+            str(row.get("summary") or row.get("type") or "")
+            for row in rows[-STATUS_LOG_LINES:]
+            if isinstance(row, dict)
+        ]
+        while lines and len("\n".join(lines).encode("utf-8")) > STATUS_LOG_BYTES:
+            lines.pop(0)
+        return lines
+
 
 class _MailboxError:
     """The last error of one mailbox, for throttling the tick-by-tick log."""
@@ -269,6 +348,7 @@ class MultiBridge:
         self.mailboxes: dict[str, Bridge] = {}
         self._invalid: set[str] = set()
         self._errors: dict[str, _MailboxError] = {}
+        self._status_errors: dict[str, _MailboxError] = {}
 
     def discover(self) -> list[str]:
         """Valid mailbox folders, sorted. Invalid names are logged once, not every tick."""
@@ -291,27 +371,44 @@ class MultiBridge:
     def run_once(self) -> tuple[int, int, int]:
         totals = [0, 0, 0]
         for name in self.discover():
+            counts = (0, 0, 0)
+            bridge = self.mailboxes.get(name)
             try:
-                bridge = self.mailboxes.get(name)
                 if bridge is None:
-                    bridge = Bridge(self.settings, self.api, self.root / name, name)
+                    bridge = Bridge(
+                        self.settings, self.api, self.root / name, name, clock=self.clock
+                    )
                     self.mailboxes[name] = bridge
                 counts = bridge.run_once()
             except Exception as exc:  # noqa: BLE001 - one broken mailbox must not stop others
                 self._log_failure(name, exc)
-                continue
-            self._log_recovery(name)
+                bridge = None
+            else:
+                self._log_recovery(name)
+            if bridge is not None:
+                # Status is a separate phase with its own error throttle: a tick that
+                # skips the interval must not look like a recovery to the log.
+                try:
+                    attempted = bridge.maybe_write_status()
+                except Exception as exc:  # noqa: BLE001 - status must not stop the pump
+                    self._log_failure(name, exc, self._status_errors)
+                else:
+                    if attempted:
+                        self._log_recovery(name, self._status_errors)
             for index, count in enumerate(counts):
                 totals[index] += count
         return totals[0], totals[1], totals[2]
 
-    def _log_failure(self, name: str, exc: Exception) -> None:
+    def _log_failure(
+        self, name: str, exc: Exception, errors: dict[str, _MailboxError] | None = None
+    ) -> None:
         """One line for a new error, then the same error at most once per 5 minutes."""
+        entries = self._errors if errors is None else errors
         signature = repr(exc)
         now = self.clock()
-        entry = self._errors.get(name)
+        entry = entries.get(name)
         if entry is None or entry.signature != signature:
-            self._errors[name] = _MailboxError(signature, now)
+            entries[name] = _MailboxError(signature, now)
             log(f"mailbox {name}: {signature}")
             return
         if now - entry.logged_at < ERROR_REPEAT_SECONDS:
@@ -321,8 +418,9 @@ class MultiBridge:
         entry.logged_at = now
         entry.repeats = 0
 
-    def _log_recovery(self, name: str) -> None:
-        if self._errors.pop(name, None) is not None:
+    def _log_recovery(self, name: str, errors: dict[str, _MailboxError] | None = None) -> None:
+        entries = self._errors if errors is None else errors
+        if entries.pop(name, None) is not None:
             log(f"mailbox {name}: recovered")
 
 

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -15,13 +17,20 @@ from agentbus.config import BridgeSettings
 from .test_queue import send
 
 
-def make_settings(share_root: Path, state: Path) -> BridgeSettings:
+def make_settings(
+    share_root: Path,
+    state: Path,
+    *,
+    interval: float = 0.0,
+    status_interval: float = 5.0,
+) -> BridgeSettings:
     return BridgeSettings(
         share_root=str(share_root),
         url="http://testserver",
         token="test-token",
         state_dir=str(state),
-        interval=0.0,
+        interval=interval,
+        status_interval=status_interval,
     )
 
 
@@ -36,8 +45,10 @@ def make_multi(
     share: Path,
     state: Path,
     clock: Callable[[], float] | None = None,
+    *,
+    status_interval: float = 5.0,
 ) -> MultiBridge:
-    settings = make_settings(share, state)
+    settings = make_settings(share, state, status_interval=status_interval)
     if clock is None:
         return MultiBridge(settings, client)
     return MultiBridge(settings, client, clock=clock)
@@ -444,3 +455,165 @@ def test_bridge_settings_resolve_the_share_root(
     monkeypatch.delenv("AGENTBUS_SHARE")
     with pytest.raises(RuntimeError):
         BridgeSettings.from_env()
+
+
+# --- status.json for the VM ---------------------------------------------------
+
+
+class StatusDownApi:
+    """The API, except the status endpoint, which is unreachable."""
+
+    def __init__(self, client: TestClient) -> None:
+        self.client = client
+
+    def get(self, path: str, params: dict | None = None):  # type: ignore[no-untyped-def]
+        if path.endswith("/status"):
+            raise httpx.ConnectError("status is down")
+        return self.client.get(path, params=params) if params else self.client.get(path)
+
+    def post(self, path: str, json: dict | None = None):  # type: ignore[no-untyped-def]
+        return self.client.post(path, json=json)
+
+
+def test_status_file_carries_slots_queues_and_pending(client: TestClient, tmp_path: Path) -> None:
+    share = tmp_path / "share"
+    write_mailbox_file(
+        share,
+        "alpha",
+        "0001.json",
+        {"recipient": "local-opencode", "kind": "task", "body": "секретный текст"},
+    )
+    now = [1000.0]
+    bridge = make_multi(client, share, tmp_path / "state", clock=lambda: now[0])
+    bridge.run_once()
+
+    path = share / "alpha" / "status.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["bridge"] == {"pid": os.getpid(), "interval": 5.0}
+    assert payload["generated_at"]
+    assert payload["workers"] == []
+    assert [row["recipient"] for row in payload["queues"]] == ["local-opencode"]
+    assert [item["kind"] for item in payload["pending"]] == ["task"]
+    text = path.read_text(encoding="utf-8")
+    assert "секретный текст" not in text
+    assert "test-token" not in text
+
+
+def test_status_log_tail_is_the_text_of_the_last_lines(
+    client: TestClient, tmp_path: Path, artifacts: str
+) -> None:
+    share = tmp_path / "share"
+    write_mailbox_file(
+        share, "alpha", "0001.json", {"recipient": "local-opencode", "kind": "task", "body": "A"}
+    )
+    now = [1000.0]
+    bridge = make_multi(client, share, tmp_path / "state", clock=lambda: now[0])
+    bridge.run_once()
+
+    task = client.get("/v1/inbox/local-opencode").json()["messages"][0]
+    client.post("/v1/inbox/local-opencode/lease")
+    log = Path(artifacts) / task["id"] / "run.log"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "text",
+                    "timestamp": index,
+                    "part": {"text": f"строка {index}", "time": {"end": index}},
+                }
+            )
+            + "\n"
+            for index in range(20)
+        ),
+        encoding="utf-8",
+    )
+
+    now[0] += 10
+    bridge.run_once()
+
+    payload = json.loads((share / "alpha" / "status.json").read_text(encoding="utf-8"))
+    pending = {item["id"]: item for item in payload["pending"]}
+    assert pending[task["id"]]["state"] == "leased"
+    assert pending[task["id"]]["log_tail"] == [f"строка {index}" for index in range(5, 20)]
+
+
+def test_status_file_is_rewritten_once_per_interval(client: TestClient, tmp_path: Path) -> None:
+    share = tmp_path / "share"
+    write_mailbox_file(
+        share, "alpha", "0001.json", {"recipient": "local-opencode", "kind": "task", "body": "A"}
+    )
+    now = [1000.0]
+    bridge = make_multi(client, share, tmp_path / "state", clock=lambda: now[0], status_interval=5)
+    path = share / "alpha" / "status.json"
+
+    bridge.run_once()
+    first = path.stat().st_mtime_ns
+    assert first > 0
+    assert not list((share / "alpha").glob(".status*")), "no temporary file is left behind"
+
+    now[0] += 1
+    bridge.run_once()
+    assert path.stat().st_mtime_ns == first, "inside the interval the file is not rewritten"
+
+    now[0] += 5
+    bridge.run_once()
+    assert path.stat().st_mtime_ns != first
+
+
+def test_status_interval_zero_turns_the_file_off(client: TestClient, tmp_path: Path) -> None:
+    share = tmp_path / "share"
+    write_mailbox_file(
+        share, "alpha", "0001.json", {"recipient": "local-opencode", "kind": "task", "body": "A"}
+    )
+
+    make_multi(client, share, tmp_path / "state", status_interval=0).run_once()
+
+    assert not (share / "alpha" / "status.json").exists()
+
+
+def test_status_error_is_written_and_the_pump_keeps_working(
+    client: TestClient, tmp_path: Path
+) -> None:
+    share = tmp_path / "share"
+    write_mailbox_file(
+        share, "alpha", "0001.json", {"recipient": "local-opencode", "kind": "task", "body": "A"}
+    )
+    bridge = MultiBridge(make_settings(share, tmp_path / "state"), StatusDownApi(client))
+
+    sent, _, _ = bridge.run_once()
+    assert sent == 1
+    assert len(client.get("/v1/inbox/local-opencode").json()["messages"]) == 1
+
+    payload = json.loads((share / "alpha" / "status.json").read_text(encoding="utf-8"))
+    assert payload["generated_at"]
+    assert "status is down" in payload["error"]
+    assert "workers" not in payload
+
+    message = send(client, recipient="alpha", sender="local-opencode", kind="result", body="ok")
+    _, delivered, _ = bridge.run_once()
+    assert delivered == 1
+    assert (share / "alpha" / "inbox" / message["id"] / "message.json").is_file()
+
+
+def test_status_errors_are_throttled_like_mailbox_errors(
+    client: TestClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    share = tmp_path / "share"
+    write_mailbox_file(
+        share, "alpha", "0001.json", {"recipient": "local-opencode", "kind": "task", "body": "A"}
+    )
+    now = [1000.0]
+    bridge = MultiBridge(
+        make_settings(share, tmp_path / "state"), StatusDownApi(client), clock=lambda: now[0]
+    )
+
+    bridge.run_once()
+    now[0] += 1
+    bridge.run_once()  # the interval skips the fetch: this is not a recovery
+    now[0] += 10
+    bridge.run_once()  # same error inside five minutes: silent
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if "mailbox alpha" in line]
+    assert len(lines) == 1
+    assert "status is down" in lines[0]

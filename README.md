@@ -106,6 +106,7 @@ worktree = одна ветка `agentbus/<thread_id>` = одна сессия Op
         message.json
         patch.diff, checks.txt, run.log
     read/                     # VM переносит сюда обработанное (необязательно)
+    status.json               # состояние очереди глазами этого ящика (см. ниже)
 ```
 
 `AGENTBUS_SHARE` — это **папка агента** (например `.agentbus/cage-claude`), а
@@ -144,6 +145,7 @@ cb inbox                  # что пришло
 cb show m_... --text      # сообщение, тикет и diff_stat
 cb patch m_...            # сам diff
 cb wait m_... [m_...] [--all] [--timeout 600]   # ответы по parent_id
+cb status [--json] [--log] [m_...]              # очередь, слоты, мои сообщения
 cb reply m_... --kind verdict "правь X"   # meta.decision = "rework"
 cb accept m_... --note "принято"          # decision.json + перенос в read/
 cb read m_...             # убрать из inbox
@@ -173,6 +175,23 @@ cb read m_...             # убрать из inbox
 `meta.decision = "rework"` и наследует `ticket` от сообщения, на которое отвечает.
 `cb accept <id>` пишет `read/<id>/decision.json` и переносит папку в `read/`; мост
 закрывает сообщение заметкой `accept` или `accept: <note>` вместо `read in the VM`.
+
+Раз в `AGENTBUS_STATUS_INTERVAL` секунд (по умолчанию 5, `0` — выключить) мост просит у
+API состояние и атомарно переписывает `<ящик>/status.json`: слоты пула, очереди по
+ящикам, сообщения этого ящика (`queued`, `leased`, последние 20 завершённых за сутки) и
+последние 30 событий его тредов. У занятого сообщения моста есть `log_tail` — последние
+15 строк `run.log` без сырых данных, чтобы видеть, что исполнитель делает сейчас. Токена
+и тел сообщений в файле нет; про чужой слот известно только имя ящика (`sender`). Если
+API недоступен, мост пишет `{"generated_at", "error"}` и продолжает возить outbox/inbox.
+
+`cb status` читает этот файл: первой строкой — его возраст (`status: 3s ago`), затем
+слоты (`local-opencode#0 busy m_… [T11] 4m`), затем свои сообщения
+(`m_… [T11] leased by local-opencode#1, attempt 1`; `queued, ~2nd in line` — оценка по
+очереди, lease может её обогнать; `done → result m_…`). `--json` печатает файл как есть,
+`--log` — `log_tail` занятых, `id ...` фильтрует сообщения. Файл старше
+`max(30, 6*interval)` секунд или отсутствует — `status is stale` и код 2. `cb wait`, если
+файл есть, печатает в stderr переходы состояния ожидаемых сообщений
+(`m_… queued → leased by …`). `cb env` показывает возраст файла.
 
 Доставка идемпотентна: имя файла в `outbox` становится ключом идемпотентности, а
 признак «уже доставлено» хранится на хосте, поэтому рестарт моста ничего не дублирует.
@@ -284,6 +303,7 @@ systemctl --user restart --no-block agentbus-worker
 | `AGENTBUS_COMMIT_AUTHOR` | автор коммитов worker, `Name <email>` |
 | `AGENTBUS_STOP_GRACE` | сколько ждать текущие задачи при SIGTERM (по умолчанию `AGENTBUS_TASK_TIMEOUT`) |
 | `AGENTBUS_SHARE_ROOT` | корень ящиков для bridge; иначе родитель `AGENTBUS_SHARE` |
+| `AGENTBUS_STATUS_INTERVAL` | период `status.json` в секундах (5 по умолчанию, 0 — выключить) |
 
 ### Уборка
 
