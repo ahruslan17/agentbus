@@ -91,7 +91,7 @@ $CB inbox                      # что пришло: id, тип, отправи
 $CB show <id> --text           # отчёт и diff_stat
 $CB show <id> | jq .meta       # branch, files_changed, checks, usage, model, harness
 $CB patch <id>                 # накопленный дифф треда
-$CB artifact <id> attempt.diff # дифф только последней попытки
+cat /home/ruslan/personal/.agentbus/<ящик>/inbox/<id>/attempt.diff   # дифф только последней попытки
 ```
 
 Исполнитель работает в ветке `agentbus/<thread_id>`. Он не пушит и не мержит.
@@ -129,7 +129,7 @@ Worker коммитит каждую попытку в ветку `agentbus/<thr
 
 - `git worktree prune` в репозиториях исполнителя. Worktree лежат на хосте в
   `~/.local/state/agentbus/worktrees`; в VM они видны как `prunable`, но их нельзя
-  чистить — иначе сломается текущий прогон. Уборка — `make prune` на хосте.
+  чистить — иначе сломается текущий прогон. Уборка — `make prune` на хосте (сначала с `PRUNE_ARGS=--dry-run`).
 - Пушить, мержить в `main`, переключать ветку в worktree исполнителя.
 
 ## Дашборд
